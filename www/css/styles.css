@@ -1,0 +1,450 @@
+
+/* ============================================
+   RIDE ANALYTICS
+   OCEAN BLUE DESIGN SYSTEM
+   ============================================ */
+
+/* 1. VARIABLES DE DISEÑO */
+
+:root {
+  --navy: #0B1F3A;
+  --deep-blue: #174A7E;
+  --blue: #2878B8;
+  --sky-blue: #78B9E7;
+  --orange: #F28C45;
+
+  --background: #F5F8FC;
+  --surface: #FFFFFF;
+  --text-main: #0B1F3A;
+  --text-muted: #64748B;
+  --border: #E1EAF3;
+
+  --radius: 16px;
+  --shadow: 0 5px 20px rgba(11,31,58,0.055);
+}
+
+/* 2. ESTILOS GLOBALES */
+
+body {
+  background: var(--background);
+  color: var(--text-main);
+  font-family: "Inter", "Segoe UI", Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+.container-fluid {
+  padding-left: 28px;
+  padding-right: 28px;
+}
+
+h1, h2, h3, h4, h5, h6 {
+  color: var(--navy);
+  font-weight: 700;
+  letter-spacing: -0.025em;
+}
+
+h2 {
+  font-size: 1.7rem;
+  margin-bottom: 10px;
+}
+
+p {
+  color: var(--text-muted);
+  line-height: 1.65;
+}
+
+/* 3. ENCABEZADO PRINCIPAL */
+
+.main-header {
+  position: relative;
+  overflow: hidden;
+
+  background: linear-gradient(
+    115deg,
+    var(--navy) 0%,
+    var(--deep-blue) 65%,
+    var(--blue) 100%
+  );
+
+  color: #FFFFFF;
+
+  padding: 34px 38px;
+  border-radius: 18px;
+
+  margin-top: 22px;
+  margin-bottom: 28px;
+
+  box-shadow: 0 10px 28px
+    rgba(11,31,58,0.12);
+}
+
+.main-header::after {
+  content: "";
+  position: absolute;
+  right: -45px;
+  top: -90px;
+
+  width: 260px;
+  height: 260px;
+
+  border-radius: 50%;
+  border: 1px solid rgba(255,255,255,0.13);
+
+  pointer-events: none;
+}
+
+.main-header h2 {
+  color: white;
+  font-size: 2rem;
+  font-weight: 750;
+  letter-spacing: -0.04em;
+  margin: 0 0 8px;
+}
+
+.main-header p {
+  color: #D8E8F6;
+  font-size: 0.94rem;
+  margin: 0;
+}
+
+/* 4. TARJETAS GENERALES */
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+
+  overflow: hidden;
+  margin-bottom: 20px;
+}
+
+.card-header {
+  background: #FFFFFF;
+  color: var(--navy);
+
+  font-size: 0.95rem;
+  font-weight: 650;
+
+  padding: 17px 20px;
+
+  border-bottom: 1px solid var(--border);
+}
+
+.card-body {
+  padding: 20px;
+}
+
+/* 5. KPI VALUE BOXES */
+
+.bslib-value-box {
+  border: none;
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+
+.bslib-value-box .value-box-title {
+  font-size: 0.82rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.bslib-value-box .value-box-value {
+  font-size: clamp(1.55rem, 2.2vw, 2.2rem);
+  font-weight: 750;
+  letter-spacing: -0.035em;
+}
+
+/* 6. FILTROS */
+
+.form-label,
+.control-label {
+  color: var(--navy);
+  font-weight: 600;
+  font-size: 0.84rem;
+  margin-bottom: 8px;
+}
+
+.form-control,
+.form-select,
+.selectize-input {
+  border: 1px solid #D7E2EF;
+  border-radius: 10px;
+  background: #FFFFFF;
+  color: var(--navy);
+  min-height: 40px;
+}
+
+.form-control:focus,
+.form-select:focus,
+.selectize-input.focus {
+  border-color: var(--blue);
+  box-shadow: 0 0 0 3px
+    rgba(40,120,184,0.12);
+}
+
+.selectize-dropdown {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: var(--shadow);
+}
+
+.selectize-dropdown .active {
+  background-color: #E7F2FB;
+  color: var(--navy);
+}
+
+/* 7. BOTONES */
+
+.btn-primary {
+  background: var(--deep-blue);
+  border-color: var(--deep-blue);
+  border-radius: 10px;
+  font-weight: 600;
+  padding: 9px 16px;
+}
+
+.btn-primary:hover {
+  background: var(--blue);
+  border-color: var(--blue);
+}
+
+.btn:focus-visible {
+  outline: 2px solid var(--orange);
+  outline-offset: 3px;
+}
+
+/* 8. GRAFICOS PLOTLY */
+
+.js-plotly-plot {
+  width: 100%;
+}
+
+.plot-container {
+  border-radius: 10px;
+}
+
+/* 9. ESPACIADO */
+
+.bslib-grid {
+  gap: 18px;
+}
+
+hr {
+  border-color: var(--border);
+  opacity: 1;
+}
+
+/* 10. RESPONSIVE */
+
+@media (max-width: 768px) {
+
+  .container-fluid {
+    padding-left: 14px;
+    padding-right: 14px;
+  }
+
+  .main-header {
+    padding: 26px 22px;
+    border-radius: 14px;
+  }
+
+  .main-header h2 {
+    font-size: 1.55rem;
+  }
+
+  .card-body {
+    padding: 15px;
+  }
+
+  .bslib-value-box .value-box-value {
+    font-size: 1.6rem;
+  }
+}
+
+/* 11. ACCESIBILIDAD */
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+  }
+}
+
+/* ============================================
+   RIDE ANALYTICS
+   SIDEBAR & NAVIGATION
+============================================ */
+
+/* 1. SIDEBAR */
+
+.bslib-sidebar-layout > .sidebar {
+  background: #0B1F3A;
+  border-right: none;
+}
+
+/* 2. IDENTIDAD */
+
+.ride-brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 5px 25px;
+  border-bottom: 1px solid
+    rgba(255,255,255,0.12);
+  margin-bottom: 24px;
+}
+
+.ride-brand-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+
+  width: 42px;
+  height: 42px;
+
+  background: #174A7E;
+  color: #FFFFFF;
+  border-radius: 12px;
+
+  font-size: 19px;
+}
+
+.ride-brand h3 {
+  color: #FFFFFF;
+  font-size: 17px;
+  font-weight: 750;
+  margin: 0;
+}
+
+.ride-brand span {
+  color: #9AB7D2;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 1.2px;
+}
+
+/* 3. TITULO DEL MENU */
+
+.ride-menu-label {
+  color: #829EBB;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 1.5px;
+  margin: 0 12px 15px;
+}
+
+/* 4. ENLACES DEL MENU */
+
+.ride-menu-link {
+  display: flex !important;
+  align-items: center;
+  gap: 12px;
+
+  width: 100%;
+  padding: 13px 15px;
+  margin-bottom: 6px;
+
+  color: #CBD9E8 !important;
+  text-decoration: none !important;
+
+  border-radius: 11px;
+
+  font-size: 13px;
+  font-weight: 500;
+
+  transition:
+    background-color 0.18s ease,
+    color 0.18s ease;
+}
+
+.ride-menu-link .fa,
+.ride-menu-link .fas,
+.ride-menu-link .svg-inline--fa {
+  width: 18px;
+  text-align: center;
+}
+
+.ride-menu-link:hover {
+  background: rgba(120,185,231,0.13);
+  color: #FFFFFF !important;
+}
+
+/* 5. ESTADO ACTIVO */
+
+.ride-menu-link.active {
+  background: #174A7E;
+  color: #FFFFFF !important;
+  font-weight: 650;
+
+  box-shadow:
+    inset 3px 0 0 #F28C45;
+}
+
+.ride-menu-link:focus-visible {
+  outline: 2px solid #78B9E7;
+  outline-offset: 2px;
+}
+
+/* 6. PIE DEL SIDEBAR */
+
+.ride-sidebar-footer {
+  border-top: 1px solid
+    rgba(255,255,255,0.12);
+
+  margin-top: 28px;
+  padding: 22px 10px 10px;
+
+  color: #D7E5F3;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.ride-sidebar-footer small {
+  display: block;
+  margin-top: 5px;
+  color: #829EBB;
+  font-size: 11px;
+  font-weight: 400;
+}
+
+/* 7. ENCABEZADO */
+
+.ride-header-kicker {
+  color: #A9D6F5;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 1.7px;
+  margin-bottom: 10px;
+}
+
+/* 8. PANTALLAS EN CONSTRUCCION */
+
+.ride-placeholder {
+  min-height: 240px;
+  display: flex;
+  justify-content: center;
+  text-align: center;
+}
+
+.ride-placeholder .card-body {
+  padding: 55px 25px;
+}
+
+/* 9. RESPONSIVE */
+
+@media (max-width: 768px) {
+
+  .ride-brand h3 {
+    font-size: 15px;
+  }
+
+  .ride-menu-link {
+    padding: 11px 12px;
+    font-size: 12px;
+  }
+}

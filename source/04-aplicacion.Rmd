@@ -1,0 +1,2064 @@
+# Aplicación estadística: análisis de viajes en taxi {#aplicacion}
+
+Este capítulo aplica los métodos de análisis exploratorio e inferencia estadística al conjunto de datos *Uber and Lyft Dataset Boston, MA* (Kaggle), que combina dos fuentes: `cab_rides.csv`, con precios de viajes de Uber y Lyft, y `weather.csv`, con mediciones meteorológicas por zona de la ciudad.
+
+El análisis sigue el flujo habitual: preparación e integración de las fuentes, evaluación de la calidad de los datos, análisis descriptivo, análisis bivariado e inferencia. Los gráficos son interactivos: al pasar el cursor se muestran los valores, es posible acercar zonas del gráfico y activar o desactivar series desde la leyenda.
+
+```{r setup-aplicacion, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(lubridate)
+library(plotly)
+library(kableExtra)
+library(scales)
+library(broom)
+
+options(scipen = 999, dplyr.width = Inf, knitr.kable.NA = "—")
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+set.seed(2024)
+
+# Paleta sobria: azul marino, azul acero, gris azulado, bronce y neutros
+paleta <- c(
+  marino = "#1F3A5F", acero = "#5B7DB1", gris = "#8A94A6",
+  bronce = "#B5833A", verde = "#4E7D6B", claro = "#D1D5DB"
+)
+col_empresa <- c(Uber = paleta[["marino"]], Lyft = paleta[["bronce"]])
+
+# Variables numéricas de análisis y sus etiquetas (unidades según la documentación del dataset)
+vars_num <- c(
+  "distance", "price", "surge_multiplier", "temp",
+  "clouds", "pressure", "rain", "humidity", "wind"
+)
+etiquetas <- c(
+  distance = "Distancia (millas)", price = "Precio (USD)",
+  surge_multiplier = "Multiplicador surge", temp = "Temperatura (°F)",
+  clouds = "Nubosidad", pressure = "Presión (mb)",
+  rain = "Lluvia (pulgadas)", humidity = "Humedad", wind = "Viento (mph)"
+)
+```
+
+```{r funciones-auxiliares}
+# Color con transparencia (para el relleno de las cajas)
+alpha_col <- function(col, a = 0.6) {
+  m <- col2rgb(col)
+  sprintf("rgba(%d,%d,%d,%.2f)", m[1], m[2], m[3], a)
+}
+
+# Valor p con formato
+fmt_p <- function(p) ifelse(p < 0.0001, "< 0.0001", sprintf("%.4f", p))
+
+# Valor p redactado para el texto: "p < 0.0001" o "p = 0.0123"
+txt_p <- function(p) ifelse(p < 0.0001, "p < 0.0001", sprintf("p = %.4f", p))
+
+# Tabla con estilo uniforme
+tabla <- function(df, caption, digits = 3, ...) {
+  df %>%
+    mutate(across(where(is.numeric), ~round(.x, digits))) %>%
+    kbl(caption = caption, format.args = list(big.mark = ","), ...) %>%
+    kable_styling(
+      bootstrap_options = c("striped", "hover", "condensed"),
+      full_width = FALSE
+    ) %>%
+    row_spec(0, bold = TRUE, color = "white", background = paleta[["marino"]])
+}
+
+# Párrafo de texto generado por el código
+texto <- function(...) cat("\n\n", paste0(...), "\n\n", sep = "")
+
+# Estilo común de los gráficos interactivos
+tema_plotly <- function(p, titulo = NULL, subtitulo = NULL, xlab = NULL, ylab = NULL,
+                        xaxis = list(), yaxis = list(), margen = list(), ...) {
+  titulo_html <- if (is.null(titulo)) NULL else paste0(
+    "<b>", titulo, "</b>",
+    if (!is.null(subtitulo)) paste0("<br><sup>", subtitulo, "</sup>") else ""
+  )
+  eje <- list(
+    gridcolor = "#E5E7EB", zeroline = FALSE, linecolor = "#9CA3AF",
+    ticks = "outside", tickcolor = "#9CA3AF"
+  )
+  eje_x <- eje; if (!is.null(xlab)) eje_x$title <- xlab
+  eje_y <- eje; if (!is.null(ylab)) eje_y$title <- ylab
+
+  p %>%
+    layout(
+      title = list(text = titulo_html, x = 0, xanchor = "left", font = list(size = 15)),
+      xaxis = modifyList(eje_x, xaxis),
+      yaxis = modifyList(eje_y, yaxis),
+      font = list(family = "Helvetica, Arial, sans-serif", size = 12, color = "#374151"),
+      paper_bgcolor = "white", plot_bgcolor = "white",
+      margin = modifyList(
+        list(t = if (is.null(titulo)) 20 else 80, l = 60, r = 20, b = 60), margen
+      ),
+      ...
+    ) %>%
+    config(displaylogo = FALSE, modeBarButtonsToRemove = c("lasso2d", "select2d"))
+}
+
+# Estadísticos de caja precalculados (evita enviar cientos de miles de puntos al navegador)
+resumen_caja <- function(data, x, y, grupo = NULL) {
+  data %>%
+    mutate(.v = .data[[y]]) %>%
+    group_by(across(all_of(c(x, grupo)))) %>%
+    summarise(
+      n = n(),
+      media = mean(.v),
+      q1 = quantile(.v, 0.25, names = FALSE),
+      mediana = median(.v),
+      q3 = quantile(.v, 0.75, names = FALSE),
+      li = min(.v[.v >= q1 - 1.5 * (q3 - q1)]),
+      ls = max(.v[.v <= q3 + 1.5 * (q3 - q1)]),
+      .groups = "drop"
+    )
+}
+
+# Diagrama de cajas interactivo a partir de los estadísticos precalculados.
+# Bigotes: 1.5 veces el rango intercuartílico; la línea punteada es la media.
+caja_plotly <- function(res, x, grupo = NULL, colores = paleta[["marino"]], modo = NULL) {
+  orden_x <- if (is.factor(res[[x]])) levels(droplevels(res[[x]])) else
+    as.character(sort(unique(res[[x]])))
+
+  if (is.null(grupo)) {
+    grupos <- list(res); nombres <- ""; cols <- colores[1]
+  } else {
+    niveles <- if (is.factor(res[[grupo]])) levels(droplevels(res[[grupo]])) else
+      sort(unique(as.character(res[[grupo]])))
+    grupos <- map(niveles, ~res[as.character(res[[grupo]]) == .x, ])
+    nombres <- niveles
+    cols <- unname(colores[niveles])
+  }
+
+  p <- plot_ly()
+  for (i in seq_along(grupos)) {
+    d <- grupos[[i]]
+    p <- add_trace(
+      p, type = "box", x = as.character(d[[x]]),
+      q1 = d$q1, median = d$mediana, q3 = d$q3,
+      lowerfence = d$li, upperfence = d$ls, mean = d$media, boxmean = TRUE,
+      name = nombres[i], showlegend = !is.null(grupo),
+      marker = list(color = cols[i]), line = list(color = cols[i]),
+      fillcolor = alpha_col(cols[i], 0.35)
+    )
+  }
+  if (is.null(modo)) modo <- if (!is.null(grupo) && identical(grupo, x)) "overlay" else "group"
+  suppressWarnings(
+    p %>% layout(
+      boxmode = modo,
+      xaxis = list(categoryorder = "array", categoryarray = orden_x)
+    )
+  )
+}
+
+# Resumen descriptivo: la media siempre junto a su desviación estándar
+# y la mediana siempre junto a su rango intercuartílico (RIQ)
+resumen_desc <- function(data, var, ...) {
+  data %>%
+    group_by(...) %>%
+    summarise(
+      n = n(),
+      media = mean({{ var }}), desviacion = sd({{ var }}),
+      mediana = median({{ var }}), iqr = IQR({{ var }}),
+      .groups = "drop"
+    )
+}
+
+# Prueba de Levene (versión de Brown-Forsythe, centrada en la mediana):
+# H0: las varianzas de todos los grupos son iguales
+levene_test <- function(valor, grupo) {
+  grupo <- droplevels(as.factor(grupo))
+  z <- abs(valor - ave(valor, grupo, FUN = median))
+  a <- anova(lm(z ~ grupo))
+  list(F = a[["F value"]][1], p = a[["Pr(>F)"]][1])
+}
+
+# Comparación de las medias de dos grupos con verificación previa de supuestos.
+#  1) Normalidad de la media muestral: si cada grupo tiene al menos 30 observaciones se
+#     acepta por el teorema central del límite; si no, se exige que Shapiro-Wilk no
+#     rechace la normalidad en ambos grupos.
+#  2) Homogeneidad de varianzas (Levene): p >= alpha -> t de Student; p < alpha -> t de Welch.
+#  3) Si no se cumple la normalidad (muestras pequeñas) -> Wilcoxon-Mann-Whitney.
+# La diferencia se calcula como (primer nivel) - (segundo nivel); invertir = TRUE la invierte.
+comparar_medias <- function(data, y, g, invertir = FALSE, alpha = 0.05) {
+  d <- tibble(y = data[[y]], g = droplevels(as.factor(data[[g]])))
+  niveles <- levels(d$g)
+  if (length(niveles) != 2) stop("Se requieren exactamente dos grupos")
+  if (invertir) niveles <- rev(niveles)
+  d$g <- factor(d$g, levels = niveles)
+  x1 <- d$y[d$g == niveles[1]]
+  x2 <- d$y[d$g == niveles[2]]
+  n1 <- length(x1); n2 <- length(x2)
+
+  p_shapiro <- function(x) {
+    m <- if (length(x) > 5000) sample(x, 5000) else x
+    if (length(m) < 3 || length(unique(m)) < 2) NA_real_ else shapiro.test(m)$p.value
+  }
+  normal_ok <- (min(n1, n2) >= 30) || isTRUE(all(c(p_shapiro(x1), p_shapiro(x2)) >= alpha))
+
+  lev <- levene_test(d$y, d$g)
+  var_igual <- isTRUE(lev$p >= alpha)
+
+  if (normal_ok) {
+    r <- t.test(y ~ g, data = d, var.equal = var_igual)
+    metodo <- if (var_igual) "t de Student" else "t de Welch"
+    dif <- unname(r$estimate[1] - r$estimate[2])
+    est <- unname(r$statistic); gl <- unname(r$parameter)
+  } else {
+    r <- wilcox.test(y ~ g, data = d, conf.int = TRUE, exact = FALSE)
+    metodo <- "Wilcoxon-Mann-Whitney"
+    dif <- unname(r$estimate); est <- unname(r$statistic); gl <- NA_real_
+  }
+  sp <- sqrt(((n1 - 1) * var(x1) + (n2 - 1) * var(x2)) / (n1 + n2 - 2))
+
+  tibble(
+    grupo_1 = niveles[1], grupo_2 = niveles[2], n1 = n1, n2 = n2,
+    p_levene = lev$p, metodo = metodo, diferencia = dif,
+    ic_inf = r$conf.int[1], ic_sup = r$conf.int[2],
+    estadistico = est, gl = gl,
+    d_cohen = (mean(x1) - mean(x2)) / sp, p_valor = r$p.value
+  )
+}
+
+# Tabla con el resultado de comparar_medias(): método elegido, Levene, diferencia, IC y valor p
+tabla_prueba <- function(res, caption, id = character(), id_lab = id, lab_p = "Valor p") {
+  res %>%
+    mutate(p_levene = fmt_p(p_levene), p_valor = fmt_p(p_valor)) %>%
+    select(all_of(id), metodo, p_levene, diferencia, ic_inf, ic_sup, estadistico, gl, d_cohen, p_valor) %>%
+    tabla(
+      caption, digits = 4,
+      col.names = c(id_lab, "Método", "Levene (valor p)", "Diferencia", "IC inf.", "IC sup.",
+                    "Estadístico", "gl", "d de Cohen", lab_p)
+    )
+}
+```
+
+## Carga y preparación de los datos
+
+### Carga de los conjuntos de datos
+
+Los archivos utilizados son `cab_rides.csv` y `weather.csv`. Se espera que ambos se encuentren dentro de una carpeta denominada `data`.
+
+```{r}
+cab_rides <- read_csv("data/cab_rides.csv", show_col_types = FALSE)
+weather   <- read_csv("data/weather.csv",   show_col_types = FALSE)
+```
+
+### Dimensiones y estructura
+
+Antes de realizar el análisis estadístico se verifica el tamaño y la estructura de los conjuntos de datos.
+
+```{r}
+tibble(
+  conjunto = c("Viajes (cab_rides)", "Clima (weather)"),
+  filas    = c(nrow(cab_rides), nrow(weather)),
+  columnas = c(ncol(cab_rides), ncol(weather))
+) %>%
+  tabla("Dimensiones iniciales de los conjuntos de datos")
+```
+
+```{r}
+glimpse(cab_rides)
+glimpse(weather)
+```
+
+### Preparación de variables
+
+Las variables categóricas de los viajes se transforman en factores. Para `cab_type` se fija el orden Uber, Lyft: de este modo, todas las diferencias entre empresas se calculan como *Uber − Lyft*.
+
+```{r}
+cab_rides <- cab_rides %>%
+  mutate(
+    cab_type    = factor(cab_type, levels = c("Uber", "Lyft")),
+    destination = as.factor(destination),
+    source      = as.factor(source),
+    name        = as.factor(name)
+  )
+```
+
+### Creación de variables temporales
+
+El `time_stamp` de los viajes está expresado en milisegundos, mientras que el de la fuente meteorológica está en segundos. Se transforma a fecha y hora local de Boston para estudiar el comportamiento de los precios durante el día, y se crea una llave horaria que permitirá relacionar ambas fuentes.
+
+```{r}
+cab_rides <- cab_rides %>%
+  mutate(
+    datetime = as_datetime(time_stamp / 1000, tz = "America/New_York"),
+    fecha    = as_date(datetime),
+    hora     = hour(datetime),
+    hora_bloque = case_when(
+      hora < 6  ~ "Madrugada",
+      hora < 12 ~ "Mañana",
+      hora < 18 ~ "Tarde",
+      TRUE      ~ "Noche"
+    ),
+    hora_bloque = factor(hora_bloque, levels = c("Madrugada", "Mañana", "Tarde", "Noche")),
+    timestamp_hour = floor(time_stamp / 1000 / 3600) * 3600
+  )
+
+cab_rides %>%
+  summarise(
+    inicio = min(fecha), fin = max(fecha),
+    dias_con_datos = n_distinct(fecha)
+  ) %>%
+  tabla("Periodo cubierto por los viajes")
+```
+
+## Calidad de los datos e integración de las fuentes
+
+### Valores faltantes en las fuentes originales
+
+La evaluación de los valores faltantes se realiza **antes** de integrar las fuentes. Así es posible entender el origen de cada faltante en su propio contexto, en lugar de aplicar una regla mecánica sobre la tabla ya unida.
+
+```{r}
+conteo_na <- function(df, fuente) {
+  df %>%
+    summarise(across(everything(), ~sum(is.na(.x)))) %>%
+    pivot_longer(everything(), names_to = "variable", values_to = "faltantes") %>%
+    mutate(fuente = fuente, total = nrow(df), porcentaje = faltantes / total * 100)
+}
+
+faltantes_fuentes <- bind_rows(
+  conteo_na(cab_rides, "Viajes"),
+  conteo_na(weather, "Clima")
+)
+
+faltantes_fuentes %>%
+  filter(faltantes > 0) %>%
+  arrange(desc(porcentaje)) %>%
+  select(fuente, variable, faltantes, total, porcentaje) %>%
+  tabla(
+    "Variables con valores faltantes por fuente",
+    col.names = c("Fuente", "Variable", "Faltantes", "Total de filas", "Porcentaje (%)")
+  )
+```
+
+```{r}
+faltantes_fuentes %>%
+  filter(faltantes > 0) %>%
+  plot_ly(
+    x = ~porcentaje, y = ~variable, color = ~fuente,
+    colors = c(Viajes = paleta[["marino"]], Clima = paleta[["bronce"]]),
+    type = "bar", orientation = "h",
+    text = ~paste0(round(porcentaje, 1), " %"), textposition = "outside",
+    hovertemplate = "%{y}: %{x:.2f} % de la fuente<extra></extra>"
+  ) %>%
+  tema_plotly(
+    titulo = "Valores faltantes por variable",
+    xlab = "Porcentaje de registros de la fuente (%)",
+    xaxis = list(range = c(0, 105)), margen = list(l = 90)
+  )
+```
+
+```{r results='asis', echo=FALSE}
+n_completas <- faltantes_fuentes %>% filter(faltantes == 0) %>% nrow()
+texto(
+  "Solo ", nrow(filter(faltantes_fuentes, faltantes > 0)),
+  " de las ", nrow(faltantes_fuentes),
+  " columnas originales presentan valores faltantes. Antes de decidir cómo tratarlos conviene diagnosticar su causa, porque los dos casos son de naturaleza distinta."
+)
+```
+
+**Precio faltante en los viajes.** Se examina qué servicios concentran los precios ausentes.
+
+```{r}
+precio_faltante <- cab_rides %>%
+  group_by(cab_type, servicio = name) %>%
+  summarise(
+    registros = n(), sin_precio = sum(is.na(price)), .groups = "drop"
+  ) %>%
+  filter(sin_precio > 0) %>%
+  mutate(porcentaje = sin_precio / registros * 100)
+
+precio_faltante %>%
+  tabla(
+    "Servicios con precio faltante",
+    col.names = c("Empresa", "Servicio", "Registros", "Sin precio", "Porcentaje (%)")
+  )
+```
+
+```{r results='asis', echo=FALSE}
+texto(
+  "Los precios faltantes se concentran en: ",
+  paste0(
+    precio_faltante$servicio, " (", round(precio_faltante$porcentaje, 1),
+    " % de sus registros)", collapse = "; "
+  ),
+  ". Estos servicios no informan tarifa en la fuente, por lo que el faltante es **estructural** y no aleatorio. Como `price` es la variable de interés, imputarla introduciría valores artificiales; por ello estos registros se excluyen del análisis."
+)
+```
+
+**Lluvia faltante en el clima.**
+
+```{r}
+weather %>%
+  summarise(
+    registros = n(),
+    sin_registro = sum(is.na(rain)),
+    porcentaje_sin_registro = sin_registro / registros * 100,
+    minimo_registrado = min(rain, na.rm = TRUE),
+    mediana_registrada = median(rain, na.rm = TRUE),
+    maximo_registrado = max(rain, na.rm = TRUE)
+  ) %>%
+  tabla("Registro de la variable lluvia en la fuente meteorológica")
+```
+
+```{r results='asis', echo=FALSE}
+pct_rain <- mean(is.na(weather$rain)) * 100
+texto(
+  "La variable `rain` carece de registro en el ", round(pct_rain, 1),
+  " % de las mediciones y, cuando existe, su valor mínimo es ",
+  min(weather$rain, na.rm = TRUE),
+  ". Este patrón es característico de un campo que solo se informa cuando hubo precipitación, de modo que se asume que **un valor ausente equivale a 0** (supuesto de trabajo). Eliminar esas filas descartaría la mayor parte de la información meteorológica y dejaría una muestra sesgada hacia las horas con lluvia."
+)
+```
+
+### Tratamiento de la fuente meteorológica
+
+Debido a que las dos fuentes tienen frecuencias distintas, se construye una serie meteorológica con una observación por zona y por hora:
+
+1. La lluvia ausente se reemplaza por 0.
+2. Si una zona tiene varias mediciones en una misma hora, se promedian.
+3. Se genera una malla completa zona × hora. Las horas sin medición se completan con la observación más cercana de la misma zona, y se conserva un indicador de cuáles fueron observadas.
+
+```{r}
+weather_horario <- weather %>%
+  mutate(
+    rain = replace_na(rain, 0),
+    timestamp_hour = floor(time_stamp / 3600) * 3600
+  ) %>%
+  group_by(location, timestamp_hour) %>%
+  summarise(
+    across(c(temp, clouds, pressure, rain, humidity, wind), mean),
+    .groups = "drop"
+  )
+
+horas <- range(c(cab_rides$timestamp_hour, weather_horario$timestamp_hour))
+
+weather_completo <- expand_grid(
+  location = unique(weather_horario$location),
+  timestamp_hour = seq(horas[1], horas[2], by = 3600)
+) %>%
+  left_join(weather_horario, by = c("location", "timestamp_hour")) %>%
+  mutate(clima_observado = !is.na(temp)) %>%
+  arrange(location, timestamp_hour) %>%
+  group_by(location) %>%
+  fill(temp, clouds, pressure, rain, humidity, wind, .direction = "downup") %>%
+  ungroup()
+
+tibble(
+  mediciones_originales = nrow(weather),
+  combinaciones_zona_hora_observadas = nrow(weather_horario),
+  combinaciones_en_la_malla = nrow(weather_completo),
+  horas_completadas = sum(!weather_completo$clima_observado)
+) %>%
+  tabla("Construcción de la serie meteorológica horaria")
+```
+
+### Integración de las fuentes
+
+Cada viaje se asocia con el clima de su zona de origen en la hora en que se solicitó.
+
+```{r}
+datos <- cab_rides %>%
+  left_join(
+    weather_completo,
+    by = c("source" = "location", "timestamp_hour" = "timestamp_hour")
+  )
+```
+
+### Validación de la integración
+
+La cantidad de filas antes y después de la unión permite verificar si la relación entre las fuentes produjo duplicaciones.
+
+```{r}
+validacion_merge <- tibble(
+  filas_antes = nrow(cab_rides),
+  filas_despues = nrow(datos),
+  diferencia = nrow(datos) - nrow(cab_rides),
+  porcentaje_clima_observado = mean(datos$clima_observado, na.rm = TRUE) * 100,
+  filas_sin_clima = sum(is.na(datos$temp))
+)
+
+validacion_merge %>%
+  tabla(
+    "Validación de la integración de información",
+    col.names = c(
+      "Filas antes", "Filas después", "Diferencia",
+      "Con clima observado en su hora (%)", "Filas sin clima"
+    )
+  )
+```
+
+```{r results='asis', echo=FALSE}
+texto(
+  if (validacion_merge$diferencia == 0) {
+    paste0("La integración conservó las ", comma(validacion_merge$filas_antes),
+           " observaciones originales y no generó duplicados.")
+  } else if (validacion_merge$diferencia > 0) {
+    paste0("**Atención:** la integración aumentó el número de filas en ",
+           comma(validacion_merge$diferencia),
+           "; existen múltiples coincidencias meteorológicas para algunas combinaciones de origen y hora.")
+  } else {
+    paste0("La integración redujo el número de filas en ",
+           comma(abs(validacion_merge$diferencia)), ".")
+  },
+  " El ", round(validacion_merge$porcentaje_clima_observado, 1),
+  " % de los viajes quedó asociado a una medición registrada en su misma zona y hora; en el resto se utiliza la observación más cercana de esa zona."
+)
+```
+
+### Tratamiento de los valores faltantes restantes
+
+Se excluyen los viajes sin precio y se verifica si persisten otros faltantes. Para ellos se mantiene un criterio basado en un umbral del 5 % de filas afectadas: si el porcentaje es inferior, se imputa (mediana para variables numéricas y moda para categóricas); si es igual o superior, se eliminan las filas afectadas.
+
+```{r}
+datos_limpios <- datos %>%
+  filter(!is.na(price)) %>%
+  select(-clima_observado) %>%
+  droplevels()
+
+filas_afectadas <- sum(!complete.cases(datos_limpios))
+porcentaje_global <- filas_afectadas / nrow(datos_limpios) * 100
+
+tibble(
+  filas_tras_excluir_precio = nrow(datos_limpios),
+  filas_con_faltantes = filas_afectadas,
+  porcentaje_afectado = porcentaje_global,
+  umbral = 5,
+  decision = case_when(
+    filas_afectadas == 0 ~ "Sin faltantes: no se requiere tratamiento",
+    porcentaje_global < 5 ~ "Imputación",
+    TRUE ~ "Eliminación de filas afectadas"
+  )
+) %>%
+  tabla("Decisión sobre los valores faltantes restantes")
+```
+
+```{r}
+moda <- function(x) names(which.max(table(x)))
+
+if (filas_afectadas > 0 && porcentaje_global < 5) {
+  datos_limpios <- datos_limpios %>%
+    mutate(
+      across(where(is.numeric), ~replace_na(.x, median(.x, na.rm = TRUE))),
+      across(where(is.factor), ~replace_na(.x, moda(.x)))
+    )
+} else if (filas_afectadas > 0) {
+  datos_limpios <- datos_limpios %>% filter(complete.cases(.))
+}
+```
+
+```{r results='asis', echo=FALSE}
+texto(
+  "Tras el tratamiento, el conjunto de datos pasó de ", comma(nrow(cab_rides)),
+  " a **", comma(nrow(datos_limpios)), "** observaciones (",
+  round(nrow(datos_limpios) / nrow(cab_rides) * 100, 1),
+  " % del total), y quedan ", sum(is.na(datos_limpios)),
+  " valores faltantes."
+)
+```
+
+### Variables derivadas
+
+Se crean las variables que se utilizarán en los análisis posteriores: el precio por unidad de distancia, un indicador de tarifa dinámica y un indicador de lluvia.
+
+```{r}
+datos_limpios <- datos_limpios %>%
+  mutate(
+    precio_por_distancia = if_else(distance > 0, price / distance, NA_real_),
+    tarifa_dinamica = factor(
+      if_else(surge_multiplier > 1, "Con tarifa dinámica", "Tarifa normal"),
+      levels = c("Tarifa normal", "Con tarifa dinámica")
+    ),
+    lluvia = factor(
+      if_else(rain > 0, "Con lluvia", "Sin lluvia"),
+      levels = c("Sin lluvia", "Con lluvia")
+    )
+  )
+```
+
+## Análisis descriptivo
+
+### Variables numéricas
+
+Se resumen las variables numéricas con medidas de **tendencia central** (media y mediana), de **dispersión** (desviación estándar y rango intercuartílico), de **amplitud** (mínimo y máximo) y de **forma** (asimetría). Cada medida de centro se presenta junto a su medida de dispersión natural: la media con la desviación estándar, y la mediana con el rango intercuartílico (RIQ). Esta convención se mantiene en todo el capítulo: **toda media se reporta junto a su desviación estándar y toda mediana junto a su RIQ**.
+
+```{r}
+asimetria <- function(x) mean((x - mean(x))^3) / sd(x)^3
+calcular_asimetria <- function(x) mean((x - mean(x))^3) / sd(x)^3
+
+estadisticos_numericos <- datos_limpios %>%
+  select(all_of(vars_num)) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "valor") %>%
+  group_by(variable) %>%
+  summarise(
+    media = mean(valor),
+    desviacion = sd(valor),
+    mediana = median(valor),
+    iqr = IQR(valor),
+    minimo = min(valor),
+    maximo = max(valor),
+    asimetria = calcular_asimetria(valor),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    variable = factor(variable, levels = vars_num),
+    # Usamos unname() para que no traiga atributos con nombres de vector
+    variable = unname(etiquetas[as.character(variable)])
+  ) %>%
+  arrange(variable)
+
+# Ahora la tabla se dibujará sin problemas
+estadisticos_numericos %>%
+  tabla(
+    "Estadísticos descriptivos de las variables numéricas",
+    col.names = c(
+      "Variable", "Media", "Desv. estándar", "Mediana", "IQR",
+      "Mínimo", "Máximo", "Asimetría"
+    ),
+    align = c("l", rep("r", 7))
+  ) %>%
+  add_header_above(
+    c(" " = 1, "Media y dispersión" = 2, "Mediana y dispersión" = 2,
+      "Amplitud" = 2, "Forma" = 1),
+    bold = TRUE, color = "white", background = paleta[["acero"]]
+  ) %>%
+  column_spec(1, bold = TRUE)
+```
+
+**Cómo leer la tabla.**
+
+- La **desviación estándar** mide cuánto se alejan, en promedio, los datos de la media. Es la dispersión que acompaña a la media, y es sensible a los valores extremos.
+- El **RIQ** mide la amplitud del 50 % central de los datos. Es la dispersión que acompaña a la mediana, y no se ve afectado por valores extremos.
+- En una distribución normal, el RIQ equivale aproximadamente a 1.35 veces la desviación estándar. Si la desviación estándar es **mucho mayor** que RIQ/1.35, existen colas largas o valores extremos que la inflan.
+- Si la media y la mediana difieren de forma importante, o la asimetría es alta en valor absoluto (por ejemplo, mayor que 1), la distribución es marcadamente asimétrica.
+
+```{r results='asis', echo=FALSE}
+fila <- estadisticos_numericos %>% filter(variable == etiquetas[["price"]])
+texto(
+  "**Ejemplo con el precio.** El precio medio es de ", round(fila$media, 2),
+  " USD con una desviación estándar de ", round(fila$desviacion, 2),
+  " USD (coeficiente de variación de ", round(fila$desviacion / fila$media * 100, 1),
+  " %). La mediana es de ", round(fila$mediana, 2),
+  " USD y el 50 % central de los precios abarca ", round(fila$iqr, 2),
+  " USD. ",
+  if (fila$desviacion > fila$iqr / 1.35 * 1.15) {
+    "La desviación estándar supera con claridad a RIQ/1.35, lo que indica colas largas en la distribución. "
+  } else "", 
+  if (fila$asimetria > 0) "La asimetría positiva confirma que unos pocos viajes de precio alto alargan la cola derecha." else "La asimetría no es positiva, por lo que no se observa una cola derecha dominante."
+)
+```
+
+### Distribución de las variables numéricas
+
+Cada variable se muestra en su propia escala. Las cajas delimitan el rango intercuartílico, la línea central es la mediana, la línea punteada es la media y los bigotes se extienden hasta 1.5 veces el rango intercuartílico. Por la cantidad de observaciones, los valores atípicos no se dibujan individualmente.
+
+```{r}
+cajas_num <- map(vars_num, function(v) {
+  tibble(variable = etiquetas[[v]], valor = datos_limpios[[v]]) %>%
+    resumen_caja("variable", "valor") %>%
+    caja_plotly("variable", colores = paleta[["marino"]]) %>%
+    layout(showlegend = FALSE)
+})
+
+subplot(cajas_num, nrows = 3, margin = 0.05) %>%
+  layout(
+    title = list(
+      text = "<b>Distribución de las variables numéricas</b>",
+      x = 0, xanchor = "left", font = list(size = 15)
+    ),
+    showlegend = FALSE, paper_bgcolor = "white", plot_bgcolor = "white",
+    font = list(family = "Helvetica, Arial, sans-serif", size = 12, color = "#374151"),
+    margin = list(t = 80)
+  ) %>%
+  config(displaylogo = FALSE, modeBarButtonsToRemove = c("lasso2d", "select2d"))
+```
+
+### Evaluación de la normalidad
+
+Muchos procedimientos estadísticos suponen que los datos provienen de una distribución normal, por lo que conviene evaluar esa compatibilidad. Se utiliza la prueba de **Shapiro-Wilk**, con las hipótesis:
+
+$$
+H_0:\text{los datos provienen de una distribución normal}
+\qquad
+H_1:\text{los datos no provienen de una distribución normal}.
+$$
+
+**Cómo se interpreta.** Si $p<0.05$ se rechaza $H_0$: hay evidencia de que la variable se aparta de la normalidad. Si $p\geq0.05$ no se rechaza $H_0$, lo que significa que no se detecta una desviación, no que la normalidad quede demostrada. Como la prueba solo admite hasta 5 000 observaciones, se aplica sobre una muestra aleatoria de ese tamaño, y se complementa con el coeficiente de asimetría calculado con todos los datos.
+
+```{r}
+normalidad <- map_dfr(vars_num, function(v) {
+  x <- datos_limpios[[v]]
+  muestra <- sample(x, min(5000, length(x)))
+  tibble(
+    variable = etiquetas[[v]],
+    asimetria = asimetria(x),
+    p_shapiro = if (sd(muestra) > 0) shapiro.test(muestra)$p.value else NA_real_
+  )
+}) %>%
+  mutate(
+    resultado = case_when(
+      is.na(p_shapiro) ~ "No evaluable",
+      p_shapiro > 0.05 ~ "Compatible con normalidad",
+      TRUE ~ "No compatible con normalidad"
+    ),
+    p_shapiro = fmt_p(p_shapiro)
+  )
+
+normalidad %>%
+  tabla(
+    "Prueba de Shapiro-Wilk (muestra de 5 000 observaciones)",
+    col.names = c("Variable", "Asimetría", "Valor p", "Resultado")
+  )
+```
+
+```{r results='asis', echo=FALSE}
+n_no <- sum(normalidad$resultado == "No compatible con normalidad")
+texto(
+  "De las ", nrow(normalidad), " variables numéricas, ", n_no,
+  " no son compatibles con normalidad según el criterio $p<0.05$. Esto es esperable en variables como la lluvia, el multiplicador de tarifa o el precio, que tienen mucha masa en pocos valores o colas largas. Para las comparaciones de medias del análisis inferencial el tamaño de muestra es muy grande, por lo que el teorema central del límite respalda el uso de pruebas sobre medias."
+)
+```
+
+### Distribución del precio
+
+```{r}
+limite <- ceiling(max(datos_limpios$price) / 2) * 2
+h <- hist(datos_limpios$price, breaks = seq(0, limite, by = 2), plot = FALSE)
+media_precio <- mean(datos_limpios$price)
+mediana_precio <- median(datos_limpios$price)
+
+plot_ly() %>%
+  add_trace(
+    type = "bar", x = h$mids, y = h$counts, width = 2, name = "Frecuencia",
+    marker = list(color = paleta[["acero"]], line = list(color = "white", width = 1)),
+    hovertemplate = "Precio: %{x:.0f} USD (± 1)<br>Frecuencia: %{y:,}<extra></extra>"
+  ) %>%
+  add_trace(
+    type = "scatter", mode = "lines",
+    x = rep(media_precio, 2), y = c(0, max(h$counts) * 1.05),
+    name = sprintf("Media (%.2f USD)", media_precio),
+    line = list(color = paleta[["marino"]], width = 2.5)
+  ) %>%
+  add_trace(
+    type = "scatter", mode = "lines",
+    x = rep(mediana_precio, 2), y = c(0, max(h$counts) * 1.05),
+    name = sprintf("Mediana (%.2f USD)", mediana_precio),
+    line = list(color = paleta[["bronce"]], width = 2.5, dash = "dash")
+  ) %>%
+  tema_plotly(
+    titulo = "Distribución del precio", subtitulo = "Clases de 2 USD",
+    xlab = "Precio (USD)", ylab = "Frecuencia", yaxis = list(tickformat = ","),
+    bargap = 0
+  )
+```
+
+```{r results='asis', echo=FALSE}
+texto(
+  "El precio promedio es de ", round(media_precio, 2), " USD (desviación estándar de ",
+  round(sd(datos_limpios$price), 2), " USD) y la mediana es de ", round(mediana_precio, 2),
+  " USD (RIQ de ", round(IQR(datos_limpios$price), 2), " USD). ",
+  if (media_precio > mediana_precio) {
+    "La media supera a la mediana, lo que es consistente con una distribución con asimetría positiva: pocos viajes de precio alto alargan la cola derecha."
+  } else if (media_precio < mediana_precio) {
+    "La media es inferior a la mediana, lo que es consistente con una distribución con asimetría negativa."
+  } else {
+    "La media y la mediana coinciden."
+  }
+)
+```
+
+### Distribución por empresa
+
+```{r}
+distribucion_empresa <- datos_limpios %>%
+  count(cab_type) %>%
+  mutate(porcentaje = n / sum(n) * 100)
+
+distribucion_empresa %>%
+  plot_ly(
+    x = ~cab_type, y = ~n, type = "bar",
+    marker = list(color = unname(col_empresa[as.character(distribucion_empresa$cab_type)])),
+    text = ~paste0(comma(n), "<br>", round(porcentaje, 1), " %"),
+    textposition = "outside", cliponaxis = FALSE,
+    hovertemplate = "%{x}: %{y:,} observaciones<extra></extra>"
+  ) %>%
+  tema_plotly(
+    titulo = "Distribución de observaciones por empresa",
+    xlab = "Empresa", ylab = "Número de observaciones",
+    yaxis = list(range = c(0, max(distribucion_empresa$n) * 1.2), tickformat = ",")
+  )
+```
+
+```{r results='asis', echo=FALSE}
+empresa_mayor <- distribucion_empresa %>% slice_max(n, n = 1, with_ties = FALSE)
+texto(
+  empresa_mayor$cab_type, " concentra el ", round(empresa_mayor$porcentaje, 2),
+  " % de las observaciones. Conviene recordar que cada observación corresponde a un servicio cotizado en una solicitud de viaje; por eso este porcentaje refleja, en parte, cuántos servicios ofrece cada empresa y no su cuota de mercado."
+)
+```
+
+### Distribución por tipo de servicio
+
+```{r}
+datos_limpios %>%
+  count(cab_type, servicio = name) %>%
+  arrange(desc(n)) %>%
+  slice_head(n = 20) %>%
+  plot_ly(
+    x = ~n, y = ~servicio, color = ~cab_type, colors = col_empresa,
+    type = "bar", orientation = "h",
+    hovertemplate = "%{y}: %{x:,} observaciones<extra></extra>"
+  ) %>%
+  tema_plotly(
+    titulo = "Principales tipos de servicio",
+    subtitulo = "Se muestran hasta los 20 servicios con mayor frecuencia",
+    xlab = "Número de observaciones",
+    xaxis = list(tickformat = ","),
+    yaxis = list(categoryorder = "total ascending"),
+    margen = list(l = 100), legend = list(title = list(text = "Empresa"))
+  )
+```
+
+### Distribución por origen y destino
+
+```{r}
+bind_rows(
+  datos_limpios %>% count(lugar = as.character(source)) %>% mutate(tipo = "Origen"),
+  datos_limpios %>% count(lugar = as.character(destination)) %>% mutate(tipo = "Destino")
+) %>%
+  mutate(tipo = factor(tipo, levels = c("Origen", "Destino"))) %>%
+  plot_ly(
+    x = ~n, y = ~lugar, color = ~tipo,
+    colors = c(Origen = paleta[["marino"]], Destino = paleta[["gris"]]),
+    type = "bar", orientation = "h",
+    hovertemplate = "%{y}: %{x:,} viajes<extra></extra>"
+  ) %>%
+  tema_plotly(
+    titulo = "Zonas de origen y destino",
+    xlab = "Número de observaciones",
+    xaxis = list(tickformat = ","),
+    yaxis = list(categoryorder = "total ascending"),
+    margen = list(l = 150), barmode = "group"
+  )
+```
+
+## Análisis exploratorio bivariado
+
+### Precio según empresa
+
+La comparación entre empresas permite pasar del comportamiento individual de las variables a la relación entre una variable categórica y la variable de interés `price`.
+
+```{r}
+precio_empresa <- datos_limpios %>%
+  group_by(cab_type) %>%
+  summarise(
+    n = n(), media = mean(price), desviacion = sd(price),
+    mediana = median(price), iqr = IQR(price),
+    minimo = min(price), maximo = max(price),
+    .groups = "drop"
+  )
+
+precio_empresa %>%
+  tabla(
+    "Precio por empresa",
+    col.names = c("Empresa", "n", "Media", "Desv. estándar", "Mediana", "RIQ", "Mínimo", "Máximo")
+  )
+```
+
+```{r}
+datos_limpios %>%
+  resumen_caja("cab_type", "price") %>%
+  caja_plotly("cab_type", grupo = "cab_type", colores = col_empresa) %>%
+  tema_plotly(
+    titulo = "Comparación de precios entre Uber y Lyft",
+    subtitulo = "La línea punteada representa la media",
+    xlab = "Empresa", ylab = "Precio (USD)"
+  )
+```
+
+Esta comparación global mezcla servicios de distinto nivel (compartido, estándar, premium), por lo que más adelante se compara cada empresa dentro de categorías equivalentes.
+
+### Tarifa dinámica y precio
+
+La variable `surge_multiplier` permite estudiar si los precios presentan cambios asociados con la tarifa dinámica.
+
+```{r}
+surge_resumen <- datos_limpios %>%
+  group_by(cab_type, surge_multiplier) %>%
+  summarise(
+    n = n(), precio_promedio = mean(price), desviacion = sd(price),
+    precio_mediano = median(price), iqr = IQR(price),
+    .groups = "drop"
+  )
+
+surge_resumen %>%
+  tabla(
+    "Precio según multiplicador de tarifa y empresa",
+    col.names = c("Empresa", "Multiplicador", "n", "Media", "Desv. estándar", "Mediana", "RIQ")
+  )
+```
+
+```{r results='asis', echo=FALSE}
+pct_surge <- datos_limpios %>%
+  group_by(cab_type) %>%
+  summarise(p = mean(surge_multiplier > 1) * 100, .groups = "drop")
+texto(
+  "El porcentaje de observaciones con multiplicador superior a 1 es de ",
+  round(pct_surge$p[pct_surge$cab_type == "Uber"], 1), " % en Uber y de ",
+  round(pct_surge$p[pct_surge$cab_type == "Lyft"], 1),
+  " % en Lyft. ",
+  if (pct_surge$p[pct_surge$cab_type == "Uber"] == 0) {
+    "**En este conjunto de datos Uber no registra tarifa dinámica**, de modo que cualquier comparación entre tarifa normal y dinámica que mezcle ambas empresas estaría confundida con la diferencia entre empresas. Por esa razón, el contraste inferencial se restringe a Lyft."
+  } else ""
+)
+```
+
+```{r}
+datos_limpios %>%
+  mutate(surge = factor(surge_multiplier)) %>%
+  resumen_caja("surge", "price", "cab_type") %>%
+  caja_plotly("surge", "cab_type", col_empresa) %>%
+  tema_plotly(
+    titulo = "Precio según multiplicador de tarifa",
+    xlab = "Multiplicador de tarifa (surge)", ylab = "Precio (USD)"
+  )
+```
+
+### Precio según periodo del día
+
+```{r}
+precio_hora <- datos_limpios %>%
+  group_by(hora, cab_type) %>%
+  summarise(
+    viajes = n(), precio_promedio = mean(price), precio_desv = sd(price),
+    precio_mediano = median(price), precio_iqr = IQR(price), .groups = "drop"
+  )
+
+precio_hora %>%
+  plot_ly(
+    x = ~hora, y = ~precio_promedio, color = ~cab_type, colors = col_empresa,
+    type = "scatter", mode = "lines+markers",
+    line = list(width = 2.5), marker = list(size = 7),
+    customdata = ~precio_desv,
+    hovertemplate = "%{x}:00 h — media %{y:.2f} USD (DE %{customdata:.2f})<extra>%{fullData.name}</extra>"
+  ) %>%
+  tema_plotly(
+    titulo = "Precio promedio durante el día",
+    xlab = "Hora del día (hora local de Boston)", ylab = "Precio promedio (USD)",
+    xaxis = list(dtick = 2), legend = list(title = list(text = "Empresa"))
+  )
+```
+
+```{r}
+hora_maxima <- precio_hora %>%
+  group_by(cab_type) %>%
+  slice_max(precio_promedio, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(cab_type, hora, viajes, precio_promedio, precio_desv, precio_mediano, precio_iqr)
+
+hora_maxima %>%
+  tabla(
+    "Hora con mayor precio promedio por empresa",
+    col.names = c(
+      "Empresa", "Hora", "Observaciones", "Media (USD)", "Desv. estándar (USD)",
+      "Mediana (USD)", "RIQ (USD)"
+    )
+  )
+```
+
+```{r results='asis', echo=FALSE}
+rango_hora <- precio_hora %>%
+  group_by(cab_type) %>%
+  summarise(r = max(precio_promedio) - min(precio_promedio), .groups = "drop")
+texto(
+  "El precio promedio máximo se observa a las ",
+  paste0(
+    hora_maxima$hora, ":00 h en ", hora_maxima$cab_type, " (media ",
+    round(hora_maxima$precio_promedio, 2), " USD, desviación estándar ",
+    round(hora_maxima$precio_desv, 2), " USD)", collapse = " y a las "
+  ),
+  ". La diferencia entre la hora más cara y la más barata es de ",
+  paste0(round(rango_hora$r, 2), " USD en ", rango_hora$cab_type, collapse = " y de "),
+  "; las horas con pocas observaciones son más inestables, por lo que conviene leer la curva junto con el volumen de viajes."
+)
+```
+
+### Precio por bloque horario
+
+```{r}
+bloques_precio <- datos_limpios %>%
+  group_by(hora_bloque, cab_type) %>%
+  summarise(
+    n = n(), precio_promedio = mean(price), desviacion = sd(price),
+    precio_mediano = median(price), iqr = IQR(price), .groups = "drop"
+  )
+
+bloques_precio %>%
+  tabla(
+    "Precio por bloque horario y empresa",
+    col.names = c("Bloque", "Empresa", "n", "Media", "Desv. estándar", "Mediana", "RIQ")
+  )
+```
+
+```{r}
+datos_limpios %>%
+  resumen_caja("hora_bloque", "price", "cab_type") %>%
+  caja_plotly("hora_bloque", "cab_type", col_empresa) %>%
+  tema_plotly(
+    titulo = "Distribución del precio por bloque horario",
+    xlab = "Bloque horario", ylab = "Precio (USD)"
+  )
+```
+
+### Precio y condiciones climáticas
+
+La segunda fuente de datos permite explorar si el clima se asocia con el precio. Primero se compara el precio según la presencia de lluvia.
+
+```{r}
+datos_limpios %>%
+  group_by(cab_type, lluvia) %>%
+  summarise(
+    n = n(), media = mean(price), desviacion = sd(price),
+    mediana = median(price), iqr = IQR(price), .groups = "drop"
+  ) %>%
+  tabla(
+    "Precio según presencia de lluvia y empresa",
+    col.names = c("Empresa", "Lluvia", "n", "Media", "Desv. estándar", "Mediana", "RIQ")
+  )
+```
+
+```{r}
+datos_limpios %>%
+  resumen_caja("lluvia", "price", "cab_type") %>%
+  caja_plotly("lluvia", "cab_type", col_empresa) %>%
+  tema_plotly(
+    titulo = "Precio con y sin lluvia", xlab = "Condición climática en el origen",
+    ylab = "Precio (USD)"
+  )
+```
+
+Luego se examina el precio promedio a lo largo de la temperatura, agrupando los viajes en diez tramos con igual número de observaciones.
+
+```{r}
+datos_limpios %>%
+  mutate(tramo = ntile(temp, 10)) %>%
+  group_by(cab_type, tramo) %>%
+  summarise(
+    temp_media = mean(temp), precio_promedio = mean(price), precio_desv = sd(price),
+    .groups = "drop"
+  ) %>%
+  plot_ly(
+    x = ~temp_media, y = ~precio_promedio, color = ~cab_type, colors = col_empresa,
+    type = "scatter", mode = "lines+markers",
+    line = list(width = 2.5), marker = list(size = 7),
+    customdata = ~precio_desv,
+    hovertemplate = "%{x:.1f} °F — media %{y:.2f} USD (DE %{customdata:.2f})<extra>%{fullData.name}</extra>"
+  ) %>%
+  tema_plotly(
+    titulo = "Precio promedio según la temperatura",
+    subtitulo = "Cada punto agrupa el 10 % de los viajes ordenados por temperatura",
+    xlab = "Temperatura media del tramo (°F)", ylab = "Precio promedio (USD)",
+    legend = list(title = list(text = "Empresa"))
+  )
+```
+
+### Distancia y precio
+
+La distancia tiene una interpretación directa sobre el costo del viaje, por lo que se analiza su relación con el precio. Para mantener el gráfico ágil se dibuja una muestra aleatoria de 15 000 viajes, pero las rectas de regresión se ajustan con todos los datos.
+
+```{r}
+muestra_viajes <- datos_limpios %>% slice_sample(n = min(15000, nrow(datos_limpios)))
+
+rectas <- datos_limpios %>%
+  group_by(cab_type) %>%
+  group_modify(~{
+    m <- lm(price ~ distance, data = .x)
+    g <- tibble(distance = seq(min(.x$distance), max(.x$distance), length.out = 50))
+    g$ajuste <- predict(m, g)
+    g
+  }) %>%
+  ungroup()
+
+plot_ly(colors = col_empresa) %>%
+  add_trace(
+    data = muestra_viajes, type = "scattergl", mode = "markers",
+    x = ~distance, y = ~price, color = ~cab_type,
+    marker = list(size = 4, opacity = 0.25),
+    hovertemplate = "Distancia: %{x:.2f} mi<br>Precio: %{y:.2f} USD<extra>%{fullData.name}</extra>"
+  ) %>%
+  add_trace(
+    data = rectas, type = "scatter", mode = "lines",
+    x = ~distance, y = ~ajuste, color = ~cab_type,
+    line = list(width = 3), showlegend = FALSE,
+    hovertemplate = "Recta ajustada: %{y:.2f} USD<extra>%{fullData.name}</extra>"
+  ) %>%
+  tema_plotly(
+    titulo = "Relación entre distancia y precio",
+    subtitulo = "Muestra de 15 000 viajes; las rectas usan todos los datos",
+    xlab = "Distancia (millas)", ylab = "Precio (USD)",
+    legend = list(title = list(text = "Empresa"))
+  )
+```
+
+### Precio por unidad de distancia
+
+Para complementar el análisis del precio total, se utiliza una métrica de precio relativo a la distancia. Se excluye el 1 % superior para evitar que los viajes muy cortos, con razones precio/distancia extremas, dominen el gráfico.
+
+```{r}
+corte_pd <- quantile(datos_limpios$precio_por_distancia, 0.99, na.rm = TRUE)
+
+datos_limpios %>%
+  filter(is.finite(precio_por_distancia), precio_por_distancia < corte_pd) %>%
+  resumen_caja("cab_type", "precio_por_distancia") %>%
+  caja_plotly("cab_type", grupo = "cab_type", colores = col_empresa) %>%
+  tema_plotly(
+    titulo = "Precio relativo a la distancia", xlab = "Empresa",
+    ylab = "Precio por milla (USD)"
+  )
+```
+
+## Análisis inferencial
+
+### Marco de interpretación de las pruebas de hipótesis
+
+Una prueba de hipótesis contrasta dos afirmaciones sobre la población: la **hipótesis nula** ($H_0$), que plantea ausencia de diferencia, de efecto o de asociación, y la **hipótesis alternativa** ($H_1$), que plantea que sí existe. En todo el capítulo las alternativas son **bilaterales**: indican que hay diferencia o asociación, sin suponer de antemano en qué dirección. En cada prueba se presentan, en este orden, el objetivo, las hipótesis, el procedimiento y sus supuestos, los resultados y la conclusión.
+
+Los resultados se leen siempre con los mismos criterios:
+
+- **Valor p.** Es la probabilidad de obtener un resultado tan extremo como el observado, o más, si $H_0$ fuera cierta. No es la probabilidad de que $H_0$ sea cierta.
+- **Regla de decisión.** Se usa un nivel de significancia $\alpha=0.05$. Si $p<0.05$ se **rechaza** $H_0$ y se concluye que hay evidencia a favor de $H_1$. Si $p\geq0.05$ **no se rechaza** $H_0$, lo que no equivale a demostrar que sea verdadera: significa que los datos no aportan evidencia suficiente en su contra.
+- **Intervalo de confianza (IC).** Es un rango de valores plausibles para el parámetro. Si el IC de una diferencia **no contiene el 0**, la conclusión coincide con rechazar $H_0$ al 5 %. Además informa la magnitud y el sentido de la diferencia.
+- **Tamaño del efecto.** Con una muestra tan grande, casi cualquier diferencia resulta estadísticamente significativa aunque sea irrelevante en la práctica. Por eso cada prueba se acompaña de una medida de magnitud: la *d* de Cohen (aproximadamente 0.2 pequeño, 0.5 mediano, 0.8 grande), $\eta^2$ (0.01, 0.06 y 0.14), el coeficiente de correlación o el cambio porcentual.
+- **Supuestos.** Antes de cada comparación de medias se verifica la normalidad (por el tamaño de muestra y, cuando hace falta, con Shapiro-Wilk) y la homogeneidad de varianzas (Levene), y con ello se elige la prueba: *t* de Student, *t* de Welch o Wilcoxon-Mann-Whitney. La lógica se explica en la sección siguiente.
+- **Pruebas múltiples.** Cuando se realizan varias pruebas a la vez aumenta la probabilidad de un falso positivo. Para controlarla se ajustan los valores $p$ con el método de Holm o se usa la prueba de Tukey.
+
+### Intervalos de confianza para el precio medio
+
+**Objetivo.** Estimar, para cada empresa, un rango de valores plausibles para el precio medio poblacional. Esto no es una prueba de hipótesis, sino una **estimación por intervalo**: no se contrasta ninguna afirmación, se cuantifica la precisión de la media muestral. Se utiliza la distribución *t* de Student:
+
+$$
+IC_{95\%} =
+\bar{x}
+\pm
+t_{0.975,n-1}
+\frac{s}{\sqrt{n}}.
+$$
+
+**Cómo se interpreta.** Un intervalo del 95 % significa que, si el procedimiento se repitiera muchas veces con muestras distintas, el 95 % de los intervalos construidos contendría la verdadera media. Un intervalo estrecho indica una estimación precisa. Si los intervalos de dos empresas no se solapan hay un indicio de diferencia, que se verifica formalmente más adelante. El intervalo *t* exige que la **media muestral** sea aproximadamente normal, lo que se cumple por el teorema central del límite con las muestras grandes de este conjunto (véase la verificación de supuestos).
+
+```{r}
+intervalos <- datos_limpios %>%
+  group_by(cab_type) %>%
+  summarise(
+    n = n(), media = mean(price), desviacion = sd(price),
+    mediana = median(price), iqr = IQR(price),
+    error = desviacion / sqrt(n),
+    limite_inferior = media - qt(0.975, n - 1) * error,
+    limite_superior = media + qt(0.975, n - 1) * error,
+    .groups = "drop"
+  )
+
+intervalos %>% tabla("Intervalos de confianza del 95 % para el precio medio", digits = 4)
+```
+
+```{r results='asis', echo=FALSE}
+texto(
+  paste0(
+    "**", intervalos$cab_type, "**: media = ", round(intervalos$media, 2),
+    " USD (desviación estándar = ", round(intervalos$desviacion, 2),
+    " USD; mediana = ", round(intervalos$mediana, 2), " USD, RIQ = ",
+    round(intervalos$iqr, 2), " USD); IC 95 % = [", round(intervalos$limite_inferior, 2), ", ",
+    round(intervalos$limite_superior, 2), "] USD.",
+    collapse = " "
+  ),
+  " El intervalo proporciona un rango de valores plausibles para la media poblacional bajo el procedimiento de muestreo utilizado. No representa la probabilidad de que la media poblacional se encuentre dentro de un intervalo ya calculado."
+)
+```
+
+### Verificación de supuestos y elección de la prueba
+
+Las pruebas *t* para comparar medias no se aplican de forma automática: cada versión exige condiciones que conviene verificar antes de interpretar el resultado. Se verifican dos, y de ellas depende qué prueba se usa.
+
+**1. Normalidad.** La prueba *t* supone que la **diferencia de medias muestrales** sigue una distribución normal; no exige que los datos individuales lo sean, salvo en muestras pequeñas. Si los datos son normales, la condición se cumple con cualquier tamaño de muestra. Si no lo son (el precio es asimétrico, como se vio en el análisis descriptivo), el **teorema central del límite** hace que las medias se aproximen a la normal cuando la muestra es suficientemente grande: como regla práctica, al menos 30 observaciones por grupo, y más si la asimetría es fuerte. La prueba de Shapiro-Wilk no sirve como único criterio, porque con miles de observaciones rechaza desviaciones triviales de la normalidad. El criterio adoptado es:
+
+- si cada grupo tiene al menos 30 observaciones, se acepta la aproximación normal de las medias (teorema central del límite);
+- si algún grupo tiene menos de 30, solo se usa la prueba *t* cuando Shapiro-Wilk no rechaza la normalidad en ambos grupos; en caso contrario se usa la prueba no paramétrica de **Wilcoxon-Mann-Whitney**.
+
+**2. Homogeneidad de varianzas.** Se usa la prueba de **Levene** en su versión de Brown-Forsythe (centrada en la mediana), que es robusta a la falta de normalidad:
+
+$$
+H_0:\sigma^2_1=\sigma^2_2
+\qquad
+H_1:\sigma^2_1\neq\sigma^2_2.
+$$
+
+Si $p\geq0.05$ no se detecta diferencia entre las varianzas y se usa la *t* de **Student** con varianza agrupada; si $p<0.05$ las varianzas difieren y se usa la *t* de **Welch**, que no las supone iguales.
+
+**Una precisión.** Elegir la prueba según el resultado de otra prueba es una práctica discutida, porque el procedimiento en dos etapas altera ligeramente las probabilidades de error. Además, con muestras de cientos de miles de observaciones Levene detecta diferencias mínimas entre varianzas, de modo que casi siempre llevará a Welch. Esto no es un problema, porque Welch también es válida cuando las varianzas son iguales; el paso de verificación deja constancia del criterio y evita aplicar Student sin sustento. Todo el procedimiento está encapsulado en la función `comparar_medias()`, que en cada comparación informa el método elegido y el valor $p$ de Levene.
+
+### Comparación de precios entre Uber y Lyft
+
+**Objetivo.** Determinar si la diferencia observada entre el precio medio de Uber y el de Lyft puede atribuirse al azar del muestreo o refleja una diferencia real entre las empresas.
+
+**Hipótesis.**
+
+$$
+H_0:\mu_{\text{Uber}}=\mu_{\text{Lyft}}
+\qquad
+H_1:\mu_{\text{Uber}}\neq\mu_{\text{Lyft}}\quad\text{(bilateral)}.
+$$
+
+**Prueba y supuestos.** Se verifican la normalidad (tamaño de muestra por empresa) y la homogeneidad de varianzas (Levene), y con ello se elige entre la *t* de Student, cuyo estadístico usa la varianza agrupada $s_p^2$,
+
+$$
+t=\frac{\bar{x}_{\text{Uber}}-\bar{x}_{\text{Lyft}}}{\sqrt{s_p^2\,(1/n_{\text{Uber}}+1/n_{\text{Lyft}})}},
+$$
+
+y la *t* de Welch, cuyo denominador es $\sqrt{s^2_{\text{Uber}}/n_{\text{Uber}}+s^2_{\text{Lyft}}/n_{\text{Lyft}}}$ y que no exige varianzas iguales.
+
+**Cómo se interpreta.** Un valor $|t|$ grande y un $p<0.05$ llevan a rechazar $H_0$. El **signo de la diferencia** indica cuál empresa es más cara: positivo, Uber; negativo, Lyft. El IC de la diferencia muestra su magnitud plausible, y la *d* de Cohen la expresa en desviaciones estándar para juzgar si es relevante en la práctica.
+
+```{r}
+desc_uber_lyft <- datos_limpios %>% resumen_desc(price, cab_type)
+
+desc_uber_lyft %>%
+  tabla(
+    "Precio por empresa: media con desviación estándar y mediana con RIQ",
+    col.names = c("Empresa", "n", "Media", "Desv. estándar", "Mediana", "RIQ")
+  )
+```
+
+```{r}
+prueba_uber_lyft <- comparar_medias(datos_limpios, "price", "cab_type")
+
+prueba_uber_lyft %>% tabla_prueba("Comparación del precio medio: Uber − Lyft")
+```
+
+```{r results='asis', echo=FALSE}
+dif <- prueba_uber_lyft$diferencia
+d_c <- prueba_uber_lyft$d_cohen
+p_ul <- prueba_uber_lyft$p_valor
+media_lyft <- desc_uber_lyft$media[desc_uber_lyft$cab_type == "Lyft"]
+sd_u <- desc_uber_lyft$desviacion[desc_uber_lyft$cab_type == "Uber"]
+sd_l <- desc_uber_lyft$desviacion[desc_uber_lyft$cab_type == "Lyft"]
+magnitud <- function(d) cut(abs(d), c(-Inf, 0.2, 0.5, 0.8, Inf),
+  labels = c("trivial", "pequeño", "mediano", "grande"), right = FALSE)
+p_wilcox <- wilcox.test(price ~ cab_type, data = datos_limpios)$p.value
+
+texto(
+  "**Verificación de supuestos.** Con ", comma(prueba_uber_lyft$n1), " observaciones de Uber y ",
+  comma(prueba_uber_lyft$n2), " de Lyft, la aproximación normal de las medias está respaldada por el teorema central del límite. La prueba de Levene arroja ",
+  txt_p(prueba_uber_lyft$p_levene),
+  if (prueba_uber_lyft$p_levene < 0.05) {
+    paste0(", por lo que las varianzas difieren (desviaciones estándar de ", round(sd_u, 2), " USD en Uber y ",
+           round(sd_l, 2), " USD en Lyft) y corresponde la *t* de Welch.")
+  } else {
+    ", por lo que no se detecta diferencia de varianzas y corresponde la *t* de Student."
+  },
+  " Método aplicado: **", prueba_uber_lyft$metodo, "**."
+)
+
+texto(
+  "**Conclusión.** Se obtiene ", txt_p(p_ul),
+  if (p_ul < 0.05) {
+    paste0(
+      ", menor que 0.05, por lo que **se rechaza $H_0$**: hay evidencia estadística de que los precios medios de Uber y Lyft difieren. La diferencia estimada (Uber − Lyft) es de ",
+      round(dif, 2), " USD (", round(dif / media_lyft * 100, 1),
+      " % respecto a Lyft), con un IC del 95 % de [",
+      round(prueba_uber_lyft$ic_inf, 2), "; ", round(prueba_uber_lyft$ic_sup, 2),
+      "] USD, que no contiene el 0. ",
+      ifelse(dif > 0, "Uber resulta más caro. ", "Lyft resulta más caro. "),
+      "La *d* de Cohen de ", round(d_c, 2), " corresponde a un efecto **", magnitud(d_c), "**."
+    )
+  } else {
+    paste0(
+      ", mayor o igual que 0.05, por lo que **no se rechaza $H_0$**: los datos no aportan evidencia suficiente de que los precios medios difieran. La diferencia estimada es de ",
+      round(dif, 2), " USD y su IC contiene el 0."
+    )
+  },
+  " Como contraste de sensibilidad, la prueba no paramétrica de Wilcoxon-Mann-Whitney, que no supone normalidad, arroja ",
+  txt_p(p_wilcox), ". Esta comparación global puede estar influida por la mezcla de servicios de cada empresa, por lo que se profundiza en la siguiente sección."
+)
+```
+
+### Comparación por categoría equivalente de servicio
+
+Para comparar servicios de nivel similar se definen equivalencias entre las ofertas de ambas empresas. Se trata de un supuesto de trabajo que puede modificarse en la siguiente tabla; los servicios sin un equivalente claro (por ejemplo, `Lux` y `WAV`) se excluyen de esta comparación.
+
+```{r}
+equivalencias <- tibble(
+  name = c("Shared", "UberPool", "Lyft", "UberX", "Lyft XL", "UberXL",
+           "Lux Black", "Black", "Lux Black XL", "Black SUV"),
+  categoria = rep(c("Compartido", "Estándar", "XL", "Premium", "Premium XL"), each = 2)
+)
+
+equivalencias %>%
+  group_by(categoria) %>%
+  summarise(servicios = paste(name, collapse = " ↔ "), .groups = "drop") %>%
+  tabla("Equivalencias entre servicios de Lyft y Uber", col.names = c("Categoría", "Servicios"))
+```
+
+**Objetivo.** Comparar a las empresas dentro de servicios de nivel similar, de modo que la diferencia no dependa de qué proporción de servicios económicos o premium ofrece cada una.
+
+**Hipótesis.** Para cada categoría $c$:
+
+$$
+H_0:\mu_{\text{Uber},c}=\mu_{\text{Lyft},c}
+\qquad
+H_1:\mu_{\text{Uber},c}\neq\mu_{\text{Lyft},c}\quad\text{(bilateral)}.
+$$
+
+**Prueba y supuestos.** En cada categoría se aplica `comparar_medias()`: se verifica la normalidad (tamaño de muestra por empresa) y la homogeneidad de varianzas (Levene), y con ello se elige entre *t* de Student, *t* de Welch o Wilcoxon-Mann-Whitney; la tabla indica el método usado en cada categoría. Como se realizan cinco pruebas simultáneas, los valores $p$ se ajustan con el método de **Holm** para controlar la probabilidad de algún falso positivo; la decisión se toma con el valor $p$ ajustado.
+
+**Cómo se interpreta.** Una diferencia positiva significa que Uber es más caro en esa categoría; una negativa, que lo es Lyft. En el gráfico, un intervalo que **no cruza la línea del 0** corresponde a una diferencia significativa.
+
+```{r}
+datos_equiv <- datos_limpios %>%
+  mutate(name = as.character(name)) %>%
+  inner_join(equivalencias, by = "name") %>%
+  mutate(categoria = factor(categoria, levels = unique(equivalencias$categoria)))
+
+datos_equiv %>%
+  resumen_desc(price, categoria, cab_type) %>%
+  tabla(
+    "Precio por categoría y empresa: media con desviación estándar y mediana con RIQ",
+    col.names = c("Categoría", "Empresa", "n", "Media", "Desv. estándar", "Mediana", "RIQ")
+  )
+```
+
+```{r}
+comparacion_cat <- datos_equiv %>%
+  group_by(categoria) %>%
+  group_modify(~comparar_medias(.x, "price", "cab_type")) %>%
+  ungroup() %>%
+  mutate(p_ajustado = p.adjust(p_valor, method = "holm"))
+
+comparacion_cat %>%
+  mutate(p_valor = p_ajustado) %>%
+  tabla_prueba(
+    "Diferencia de precio medio (Uber − Lyft) por categoría equivalente",
+    id = "categoria", id_lab = "Categoría", lab_p = "Valor p (Holm)"
+  )
+```
+
+```{r}
+cat_plot <- comparacion_cat %>%
+  arrange(diferencia) %>%
+  mutate(categoria = factor(categoria, levels = categoria))
+
+plot_ly(
+  cat_plot, x = ~diferencia, y = ~categoria, type = "scatter", mode = "markers",
+  marker = list(color = paleta[["marino"]], size = 10),
+  error_x = list(
+    type = "data", symmetric = FALSE, color = paleta[["marino"]],
+    array = cat_plot$ic_sup - cat_plot$diferencia,
+    arrayminus = cat_plot$diferencia - cat_plot$ic_inf
+  ),
+  hovertemplate = "%{y}<br>Diferencia: %{x:.2f} USD<extra></extra>"
+) %>%
+  tema_plotly(
+    titulo = "Diferencia de precio medio por categoría (Uber − Lyft)",
+    subtitulo = "Valores positivos: Uber es más caro. Barras: IC del 95 %",
+    xlab = "Diferencia de precio medio (USD)",
+    margen = list(l = 110),
+    shapes = list(list(
+      type = "line", x0 = 0, x1 = 0, y0 = 0, y1 = 1, yref = "paper",
+      line = list(color = paleta[["gris"]], dash = "dot")
+    ))
+  )
+```
+
+```{r results='asis', echo=FALSE}
+mas_uber <- comparacion_cat %>% filter(p_ajustado < 0.05, diferencia > 0) %>% pull(categoria) %>% as.character()
+mas_lyft <- comparacion_cat %>% filter(p_ajustado < 0.05, diferencia < 0) %>% pull(categoria) %>% as.character()
+sin_dif  <- comparacion_cat %>% filter(p_ajustado >= 0.05) %>% pull(categoria) %>% as.character()
+lista <- function(x) if (length(x) == 0) "ninguna" else paste(x, collapse = ", ")
+texto(
+  "**Conclusión.** Tras el ajuste de Holm, Uber resulta más caro en: ", lista(mas_uber),
+  ". Lyft resulta más caro en: ", lista(mas_lyft),
+  ". Sin diferencia significativa en: ", lista(sin_dif),
+  ". Comparar categorías equivalentes evita que la diferencia global quede determinada por la proporción de servicios económicos o premium que ofrece cada empresa."
+)
+```
+
+### Tarifa normal frente a tarifa dinámica
+
+**Objetivo.** Evaluar si los viajes de Lyft con tarifa dinámica tienen un precio medio distinto al de los viajes con tarifa normal. Como Uber no registra tarifa dinámica en estos datos, la comparación se limita a Lyft, de modo que la diferencia entre empresas no confunda el resultado.
+
+**Hipótesis.**
+
+$$
+H_0:\mu_{\text{normal}}=\mu_{\text{dinámica}}
+\qquad
+H_1:\mu_{\text{normal}}\neq\mu_{\text{dinámica}}\quad\text{(bilateral)}.
+$$
+
+**Prueba y supuestos.** Se aplica `comparar_medias()`: verificación de normalidad (tamaño de cada grupo), prueba de Levene para las varianzas y elección entre *t* de Student, *t* de Welch o Wilcoxon-Mann-Whitney. El grupo con tarifa dinámica es el más pequeño, por lo que su tamaño es el que determina si basta el teorema central del límite.
+
+**Cómo se interpreta.** Si $p<0.05$ se rechaza $H_0$. La diferencia se presenta como *dinámica − normal*: un valor positivo indica que la tarifa dinámica encarece el viaje, y el IC muestra en cuánto.
+
+```{r}
+datos_lyft <- datos_limpios %>% filter(cab_type == "Lyft") %>% droplevels()
+
+datos_lyft %>%
+  resumen_desc(price, tarifa_dinamica) %>%
+  tabla(
+    "Lyft: precio según tarifa, con media y desviación estándar, mediana y RIQ",
+    col.names = c("Tarifa", "n", "Media", "Desv. estándar", "Mediana", "RIQ")
+  )
+```
+
+```{r}
+surge_test <- comparar_medias(datos_lyft, "price", "tarifa_dinamica", invertir = TRUE)
+
+surge_test %>% tabla_prueba("Lyft: precio con tarifa dinámica − precio con tarifa normal")
+```
+
+```{r results='asis', echo=FALSE}
+n_surge <- sum(datos_lyft$tarifa_dinamica == "Con tarifa dinámica")
+dif_s <- surge_test$diferencia
+texto(
+  "**Verificación de supuestos.** El grupo menor tiene ", comma(min(surge_test$n1, surge_test$n2)),
+  " observaciones, ", ifelse(min(surge_test$n1, surge_test$n2) >= 30,
+    "suficientes para aceptar la aproximación normal de las medias. ",
+    "pocas para apoyarse en el teorema central del límite, por lo que se consultó Shapiro-Wilk. "),
+  "La prueba de Levene arroja ", txt_p(surge_test$p_levene), ". Método aplicado: **", surge_test$metodo, "**."
+)
+texto(
+  "**Conclusión.** Se obtiene ", txt_p(surge_test$p_valor),
+  if (surge_test$p_valor < 0.05) {
+    paste0(", por lo que **se rechaza $H_0$**: el precio medio de los viajes de Lyft con tarifa dinámica difiere del de los viajes con tarifa normal; en promedio es ",
+           round(abs(dif_s), 2), " USD ", ifelse(dif_s > 0, "mayor", "menor"), ".")
+  } else {
+    ", por lo que **no se rechaza $H_0$**: no hay evidencia suficiente de una diferencia entre ambos precios medios."
+  },
+  " La comparación se basa en ", comma(n_surge),
+  " viajes con tarifa dinámica. Al no controlar el tipo de servicio ni la distancia, esta diferencia es descriptiva; el modelo de regresión de la sección final permite aislar el efecto del multiplicador."
+)
+```
+
+### Lluvia, precio y tarifa dinámica
+
+La integración con la fuente meteorológica permite preguntar si la lluvia se asocia con el precio y con la activación de la tarifa dinámica.
+
+**Objetivo.** Evaluar si la lluvia en la zona de origen se asocia con el precio del viaje y con la activación de la tarifa dinámica.
+
+**a) Precio con y sin lluvia.** Para cada empresa:
+
+$$
+H_0:\mu_{\text{con lluvia}}=\mu_{\text{sin lluvia}}
+\qquad
+H_1:\mu_{\text{con lluvia}}\neq\mu_{\text{sin lluvia}}\quad\text{(bilateral)}.
+$$
+
+Se aplica `comparar_medias()` en cada empresa (verificación de normalidad, Levene y elección de la prueba), con ajuste de Holm por tratarse de dos pruebas. La diferencia se presenta como *con lluvia − sin lluvia*: un valor positivo indica que llover encarece el viaje.
+
+```{r}
+datos_limpios %>%
+  resumen_desc(price, cab_type, lluvia) %>%
+  tabla(
+    "Precio con y sin lluvia: media con desviación estándar y mediana con RIQ",
+    col.names = c("Empresa", "Lluvia", "n", "Media", "Desv. estándar", "Mediana", "RIQ")
+  )
+```
+
+```{r}
+clima_empresa <- datos_limpios %>%
+  group_by(cab_type) %>%
+  group_modify(~comparar_medias(.x, "price", "lluvia", invertir = TRUE)) %>%
+  ungroup() %>%
+  mutate(p_ajustado = p.adjust(p_valor, method = "holm"))
+
+clima_empresa %>%
+  mutate(p_valor = p_ajustado) %>%
+  tabla_prueba(
+    "Precio con lluvia − sin lluvia, por empresa",
+    id = "cab_type", id_lab = "Empresa", lab_p = "Valor p (Holm)"
+  )
+```
+
+```{r results='asis', echo=FALSE}
+texto(
+  "**Conclusión.** Tras el ajuste de Holm, la diferencia de precio con y sin lluvia es significativa en ",
+  sum(clima_empresa$p_ajustado < 0.05), " de ", nrow(clima_empresa), " empresas",
+  if (any(clima_empresa$p_ajustado < 0.05)) {
+    paste0(
+      " (", paste(clima_empresa$cab_type[clima_empresa$p_ajustado < 0.05], collapse = ", "),
+      "), con una diferencia de ",
+      paste0(round(clima_empresa$diferencia[clima_empresa$p_ajustado < 0.05], 2), " USD",
+             collapse = " y "),
+      ". Conviene contrastar esa magnitud con el precio medio y su desviación estándar (tabla anterior) para juzgar si es relevante en la práctica."
+    )
+  } else ". No hay evidencia de que la lluvia modifique el precio medio."
+)
+```
+
+**b) Proporción de tarifa dinámica con y sin lluvia (Lyft).** Se compara la proporción de viajes con multiplicador superior a 1:
+
+$$
+H_0:p_{\text{con lluvia}}=p_{\text{sin lluvia}}
+\qquad
+H_1:p_{\text{con lluvia}}\neq p_{\text{sin lluvia}}\quad\text{(bilateral)}.
+$$
+
+Se utiliza la prueba de proporciones basada en el estadístico $\chi^2$ (sin corrección de continuidad por el tamaño de muestra). La diferencia se expresa en **puntos porcentuales** (con − sin): un valor positivo indica que la tarifa dinámica es más frecuente cuando llueve.
+
+```{r}
+prop_surge <- datos_lyft %>%
+  group_by(lluvia) %>%
+  summarise(
+    n = n(),
+    con_surge = sum(tarifa_dinamica == "Con tarifa dinámica"),
+    proporcion = con_surge / n * 100,
+    .groups = "drop"
+  )
+
+prop_surge %>%
+  tabla(
+    "Viajes de Lyft con tarifa dinámica según lluvia",
+    col.names = c("Condición", "Viajes", "Con tarifa dinámica", "Proporción (%)")
+  )
+
+prueba_proporcion <- prop.test(prop_surge$con_surge, prop_surge$n, correct = FALSE)
+
+tidy(prueba_proporcion) %>%
+  transmute(
+    diferencia_pp = -(estimate1 - estimate2) * 100,
+    ic_inferior_pp = -conf.high * 100, ic_superior_pp = -conf.low * 100,
+    chi_cuadrado = statistic, p_valor = fmt_p(p.value)
+  ) %>%
+  tabla(
+    "Prueba de proporciones: tarifa dinámica con lluvia − sin lluvia",
+    col.names = c(
+      "Diferencia (puntos porcentuales)", "IC inf.", "IC sup.", "χ²", "Valor p"
+    )
+  )
+```
+
+```{r results='asis', echo=FALSE}
+p_con <- prop_surge$proporcion[prop_surge$lluvia == "Con lluvia"]
+p_sin <- prop_surge$proporcion[prop_surge$lluvia == "Sin lluvia"]
+texto(
+  "**Conclusión.** La proporción de viajes de Lyft con tarifa dinámica es de ", round(p_con, 2),
+  " % con lluvia y de ", round(p_sin, 2), " % sin lluvia (", txt_p(prueba_proporcion$p.value), "). ",
+  if (prueba_proporcion$p.value < 0.05) {
+    "Como $p<0.05$, **se rechaza $H_0$**: la tarifa dinámica se activa con distinta frecuencia según haya o no lluvia."
+  } else {
+    "Como $p\\geq0.05$, **no se rechaza $H_0$**: no hay evidencia de que la lluvia modifique la frecuencia de la tarifa dinámica."
+  }
+)
+```
+
+### ANOVA: precio según tipo de servicio
+
+**Objetivo.** Determinar si el precio medio es el mismo en todos los tipos de servicio o si al menos uno difiere. Comparar varios grupos con múltiples pruebas *t* aumentaría el riesgo de falsos positivos; el ANOVA los contrasta en una sola prueba global.
+
+**Hipótesis.**
+
+$$
+H_0:\mu_1=\mu_2=\cdots=\mu_k
+\qquad
+H_1:\text{al menos una de las medias es diferente}.
+$$
+
+**Prueba y supuestos.** El estadístico es $F=\dfrac{\text{variabilidad entre servicios}}{\text{variabilidad dentro de los servicios}}$. Un $F$ grande indica que las diferencias entre servicios son grandes en relación con la variación natural dentro de cada uno. El ANOVA clásico supone observaciones independientes, normalidad aproximada de las medias de cada grupo (que el teorema central acompaña si cada grupo es grande) y **varianzas homogéneas**. Este último supuesto se verifica con la prueba de **Levene**: si $p\geq0.05$ se toma el ANOVA clásico; si $p<0.05$ se toma el **ANOVA de Welch**, que tiene las mismas hipótesis pero no exige varianzas iguales.
+
+**Cómo se interpreta.** Si $p<0.05$ se rechaza $H_0$: no todos los servicios tienen el mismo precio medio. El ANOVA **no indica cuáles** difieren; para eso se usan las comparaciones por pares de la sección siguiente. Debido al número de categorías, se seleccionan los diez servicios con mayor frecuencia, ordenados por su precio mediano.
+
+```{r}
+servicios_principales <- datos_limpios %>%
+  count(servicio = name, sort = TRUE) %>%
+  slice_head(n = 10) %>%
+  pull(servicio)
+
+datos_anova <- datos_limpios %>%
+  filter(name %in% servicios_principales) %>%
+  droplevels() %>%
+  mutate(name = fct_reorder(name, price, .fun = median))
+
+datos_anova %>%
+  resumen_desc(price, name) %>%
+  arrange(mediana) %>%
+  tabla(
+    "Precio por servicio: media con desviación estándar y mediana con RIQ",
+    col.names = c("Servicio", "n", "Media", "Desv. estándar", "Mediana", "RIQ")
+  )
+```
+
+```{r}
+modelo_anova <- aov(price ~ name, data = datos_anova)
+anova_resultado <- tidy(modelo_anova)
+
+anova_resultado %>%
+  mutate(p.value = fmt_p(p.value)) %>%
+  tabla(
+    "ANOVA clásico del precio según servicio", digits = 2,
+    col.names = c("Fuente", "gl", "Suma de cuadrados", "Cuadrado medio", "F", "Valor p")
+  )
+```
+
+**Verificación de supuestos y elección del método.** Los precios de los servicios tienen desviaciones estándar muy distintas (un servicio compartido y uno de lujo no se parecen en dispersión), lo que hace dudar de la homogeneidad de varianzas. Se contrasta con Levene y se calcula $\eta^2$, la proporción de la variabilidad del precio explicada por el tipo de servicio (aproximadamente 0.01 pequeño, 0.06 mediano, 0.14 grande).
+
+```{r}
+levene_anova <- levene_test(datos_anova$price, datos_anova$name)
+welch_anova <- oneway.test(price ~ name, data = datos_anova, var.equal = FALSE)
+usar_welch <- levene_anova$p < 0.05
+n_min_serv <- min(table(datos_anova$name))
+
+ss <- anova_resultado$sumsq
+eta2 <- ss[anova_resultado$term == "name"] / sum(ss)
+p_clasico <- anova_resultado$p.value[anova_resultado$term == "name"]
+p_anova <- if (usar_welch) welch_anova$p.value else p_clasico
+
+tibble(
+  metodo = c("Levene (Brown-Forsythe)", "ANOVA clásico", "ANOVA de Welch"),
+  estadistico_F = c(
+    levene_anova$F, anova_resultado$statistic[anova_resultado$term == "name"],
+    unname(welch_anova$statistic)
+  ),
+  p_valor = fmt_p(c(levene_anova$p, p_clasico, welch_anova$p.value)),
+  eta_cuadrado = c(NA, eta2, NA)
+) %>%
+  tabla("Verificación de varianzas, contraste robusto y tamaño del efecto", digits = 3,
+        col.names = c("Método", "F", "Valor p", "η²"))
+```
+
+```{r results='asis', echo=FALSE}
+texto(
+  "**Elección del método.** El servicio con menos observaciones tiene ", comma(n_min_serv),
+  ", por lo que la aproximación normal de las medias está respaldada por el teorema central del límite. La prueba de Levene arroja ",
+  txt_p(levene_anova$p),
+  if (usar_welch) {
+    ", de modo que **no se cumple la homogeneidad de varianzas** y se toma como resultado principal el **ANOVA de Welch**."
+  } else {
+    ", de modo que no se detecta diferencia de varianzas y se toma como resultado principal el **ANOVA clásico**."
+  }
+)
+texto(
+  "**Conclusión.** El ANOVA ", ifelse(usar_welch, "de Welch", "clásico"), " arroja ", txt_p(p_anova),
+  if (p_anova < 0.05) {
+    ", por lo que **se rechaza $H_0$**: no todos los tipos de servicio presentan el mismo precio medio."
+  } else {
+    ", por lo que **no se rechaza $H_0$**: no hay evidencia suficiente de que los precios medios difieran entre servicios."
+  },
+  " La otra versión (", ifelse(usar_welch, "clásico", "Welch"), ", ",
+  txt_p(if (usar_welch) p_clasico else welch_anova$p.value), ") ",
+  if (((if (usar_welch) p_clasico else welch_anova$p.value) < 0.05) == (p_anova < 0.05)) "lleva a la misma decisión" else "lleva a una decisión distinta, por lo que el resultado debe tomarse con cautela",
+  ". Con $\\eta^2=", round(eta2, 3), "$, el tipo de servicio explica el ", round(eta2 * 100, 1),
+  " % de la variabilidad del precio, un efecto ",
+  as.character(cut(eta2, c(-Inf, 0.01, 0.06, 0.14, Inf), labels = c("trivial", "pequeño", "mediano", "grande"), right = FALSE)),
+  "."
+)
+```
+
+```{r}
+datos_anova %>%
+  resumen_caja("name", "price", "cab_type") %>%
+  caja_plotly("name", "cab_type", col_empresa, modo = "overlay") %>%
+  tema_plotly(
+    titulo = "Distribución de precios por tipo de servicio",
+    subtitulo = "Servicios ordenados por precio mediano",
+    xlab = "Tipo de servicio", ylab = "Precio (USD)",
+    legend = list(title = list(text = "Empresa"))
+  )
+```
+
+### Comparaciones múltiples por pares
+
+**Objetivo.** Como el ANOVA solo indica que existe alguna diferencia, estas comparaciones identifican **entre qué pares de servicios** se encuentra.
+
+**Hipótesis.** Para cada par de servicios $i$ y $j$:
+
+$$
+H_0:\mu_i=\mu_j
+\qquad
+H_1:\mu_i\neq\mu_j\quad\text{(bilateral)}.
+$$
+
+**Método y supuestos.** La prueba de **Tukey** (HSD) supone varianzas homogéneas. Por eso el método depende del resultado de Levene en la sección anterior: si las varianzas son homogéneas se usa Tukey; si no, se compara cada par con la *t* de Welch y los valores $p$ se ajustan con el método de **Holm** (los intervalos de confianza se ajustan con Bonferroni para mantener el 95 % simultáneo).
+
+**Cómo se interpreta.** Ambos métodos controlan el error global por realizar todas las comparaciones a la vez, por lo que se decide con el valor $p$ ajustado. En el gráfico, cada punto es la diferencia de precio medio del par y la barra es su IC del 95 %: si la barra **no cruza el 0**, se rechaza $H_0$ y esos dos servicios tienen precios medios distintos. El sentido de la diferencia sigue el orden del nombre (*A-B* es la media de A menos la de B).
+
+```{r}
+if (!usar_welch) {
+  metodo_pares <- "Tukey HSD"
+  tukey_df <- TukeyHSD(modelo_anova)$name %>%
+    as.data.frame() %>%
+    rownames_to_column("comparacion") %>%
+    as_tibble() %>%
+    rename(p_ajustado = `p adj`)
+} else {
+  metodo_pares <- "t de Welch por pares con ajuste de Holm"
+  pares <- combn(levels(datos_anova$name), 2, simplify = FALSE)
+  m_pares <- length(pares)
+  tukey_df <- map_dfr(pares, function(p) {
+    x1 <- datos_anova$price[datos_anova$name == p[1]]
+    x2 <- datos_anova$price[datos_anova$name == p[2]]
+    r <- t.test(x2, x1, conf.level = 1 - 0.05 / m_pares)
+    tibble(
+      comparacion = paste0(p[2], "-", p[1]),
+      diff = unname(r$estimate[1] - r$estimate[2]),
+      lwr = r$conf.int[1], upr = r$conf.int[2], p.value = r$p.value
+    )
+  }) %>%
+    mutate(p_ajustado = p.adjust(p.value, method = "holm"))
+}
+
+tukey_df <- tukey_df %>%
+  mutate(significativa = if_else(p_ajustado < 0.05, "Significativa (p ajustado < 0.05)", "No significativa")) %>%
+  arrange(diff) %>%
+  mutate(comparacion = factor(comparacion, levels = comparacion))
+
+plot_ly(
+  tukey_df, x = ~diff, y = ~comparacion, color = ~significativa,
+  colors = c("Significativa (p ajustado < 0.05)" = paleta[["marino"]],
+             "No significativa" = paleta[["bronce"]]),
+  type = "scatter", mode = "markers", marker = list(size = 7),
+  error_x = list(
+    type = "data", symmetric = FALSE,
+    array = tukey_df$upr - tukey_df$diff,
+    arrayminus = tukey_df$diff - tukey_df$lwr, thickness = 1
+  ),
+  height = 900,
+  hovertemplate = "%{y}<br>Diferencia: %{x:.2f} USD<br>p ajustado: %{customdata:.4f}<extra></extra>",
+  customdata = ~p_ajustado
+) %>%
+  tema_plotly(
+    titulo = "Comparaciones múltiples por pares",
+    subtitulo = paste0("Método: ", metodo_pares, ". Barras: IC del 95 % simultáneo"),
+    xlab = "Diferencia de precio medio (USD)",
+    margen = list(l = 160),
+    shapes = list(list(
+      type = "line", x0 = 0, x1 = 0, y0 = 0, y1 = 1, yref = "paper",
+      line = list(color = paleta[["gris"]], dash = "dot")
+    ))
+  )
+```
+
+```{r results='asis', echo=FALSE}
+n_sig <- sum(tukey_df$p_ajustado < 0.05)
+texto(
+  "**Conclusión.** Con el método **", metodo_pares, "**, se identifican ", n_sig, " de ", nrow(tukey_df),
+  " comparaciones por pares con diferencias estadísticamente significativas después del ajuste por comparaciones múltiples",
+  if (n_sig < nrow(tukey_df)) {
+    paste0(
+      "; las restantes corresponden a servicios cuyos precios medios no se distinguen entre sí: ",
+      paste(tukey_df$comparacion[tukey_df$p_ajustado >= 0.05], collapse = ", "), "."
+    )
+  } else "."
+)
+```
+
+### Correlaciones entre variables numéricas
+
+**Objetivo.** Identificar de forma exploratoria qué variables numéricas se mueven juntas y detectar posible redundancia entre ellas. La correlación de Pearson estandariza la covarianza y toma valores entre $-1$ y $1$.
+
+**Cómo se interpreta.** El signo indica el sentido de la relación (positivo: ambas variables aumentan juntas; negativo: una sube cuando la otra baja) y el valor absoluto su intensidad. Como guía aproximada: $|r|<0.3$ relación débil, entre $0.3$ y $0.7$ moderada y mayor que $0.7$ fuerte. La correlación mide únicamente asociación **lineal**, y no implica causalidad. La matriz es descriptiva: no contrasta hipótesis. Las variables se ordenan por agrupamiento jerárquico para que las más relacionadas queden juntas.
+
+```{r}
+matriz_cor <- datos_limpios %>%
+  select(all_of(vars_num)) %>%
+  cor(use = "pairwise.complete.obs", method = "pearson")
+
+orden <- hclust(as.dist(1 - abs(matriz_cor)))$order
+matriz_cor <- matriz_cor[orden, orden]
+etq <- unname(etiquetas[colnames(matriz_cor)])
+
+m_plot <- matriz_cor
+m_plot[upper.tri(m_plot)] <- NA
+
+anotaciones <- expand_grid(i = seq_along(etq), j = seq_along(etq)) %>%
+  filter(j <= i) %>%
+  pmap(function(i, j) {
+    r <- matriz_cor[i, j]
+    list(
+      x = etq[j], y = etq[i], text = sprintf("%.2f", r), showarrow = FALSE,
+      font = list(size = 11, color = if (abs(r) > 0.55) "white" else "#1F2937")
+    )
+  })
+
+plot_ly(
+  x = etq, y = etq, z = m_plot, type = "heatmap", height = 560,
+  zmin = -1, zmax = 1, xgap = 1, ygap = 1,
+  colorscale = list(c(0, paleta[["bronce"]]), c(0.5, "#F8FAFC"), c(1, paleta[["marino"]])),
+  colorbar = list(title = "r", len = 0.7),
+  hovertemplate = "%{y}<br>%{x}<br>r = %{z:.3f}<extra></extra>"
+) %>%
+  tema_plotly(
+    titulo = "Matriz de correlaciones de Pearson",
+    xaxis = list(tickangle = -40, side = "bottom", showgrid = FALSE, ticks = ""),
+    yaxis = list(autorange = "reversed", showgrid = FALSE, ticks = ""),
+    margen = list(l = 150, b = 130), annotations = anotaciones
+  )
+```
+
+### Variables altamente correlacionadas
+
+Se utiliza como criterio exploratorio $|r|\geq 0.80$ para identificar relaciones lineales fuertes.
+
+```{r}
+cor_alta <- matriz_cor %>%
+  as.data.frame() %>%
+  rownames_to_column("variable_1") %>%
+  pivot_longer(-variable_1, names_to = "variable_2", values_to = "correlacion") %>%
+  filter(variable_1 < variable_2, abs(correlacion) >= 0.80) %>%
+  arrange(desc(abs(correlacion))) %>%
+  mutate(across(c(variable_1, variable_2), ~unname(etiquetas[.x])))
+
+if (nrow(cor_alta) > 0) {
+  cor_alta %>% tabla("Variables con correlación absoluta alta",
+                     col.names = c("Variable 1", "Variable 2", "Correlación"))
+}
+```
+
+```{r results='asis', echo=FALSE}
+texto(
+  if (nrow(cor_alta) == 0) {
+    "Ningún par de variables alcanza el umbral $|r|\\geq 0.80$, por lo que no se observa redundancia lineal fuerte entre ellas."
+  } else {
+    "Los pares de la tabla anterior presentan una relación lineal fuerte, lo que puede indicar redundancia de información en un análisis posterior de modelamiento."
+  },
+  " La presencia de una correlación elevada no implica por sí misma causalidad."
+)
+```
+
+### Correlación entre distancia y precio
+
+**Objetivo.** Evaluar si existe asociación lineal entre la distancia y el precio de un viaje, y qué tan intensa es.
+
+**Hipótesis.** Con $\rho$ como el coeficiente de correlación poblacional:
+
+$$
+H_0:\rho=0
+\qquad
+H_1:\rho\neq0\quad\text{(bilateral)}.
+$$
+
+**Prueba y supuestos.** La prueba de Pearson usa el estadístico $t=r\sqrt{(n-2)/(1-r^2)}$ y supone una relación lineal. Como el precio es asimétrico, se complementa con la correlación de **Spearman**, que mide asociación monótona a partir de rangos y es robusta a valores extremos.
+
+**Cómo se interpreta.** Si $p<0.05$ se rechaza $H_0$ y hay evidencia de asociación. Sin embargo, con muchos datos hasta una correlación muy pequeña resulta significativa, por lo que la **magnitud** de $r$ importa más que el valor $p$. El cuadrado del coeficiente, $r^2$, es la proporción de la variabilidad del precio que explica la relación lineal con la distancia.
+
+```{r}
+cor_pearson <- cor.test(datos_limpios$distance, datos_limpios$price, method = "pearson")
+cor_spearman <- cor.test(datos_limpios$distance, datos_limpios$price,
+                         method = "spearman", exact = FALSE)
+
+tibble(
+  metodo = c("Pearson", "Spearman"),
+  coeficiente = c(unname(cor_pearson$estimate), unname(cor_spearman$estimate)),
+  ic_inferior = c(cor_pearson$conf.int[1], NA),
+  ic_superior = c(cor_pearson$conf.int[2], NA),
+  p_valor = fmt_p(c(cor_pearson$p.value, cor_spearman$p.value))
+) %>%
+  tabla("Correlación entre distancia y precio", digits = 4,
+        col.names = c("Método", "Coeficiente", "IC inf.", "IC sup.", "Valor p"))
+```
+
+```{r results='asis', echo=FALSE}
+r_dp <- unname(cor_pearson$estimate)
+intensidad <- as.character(cut(abs(r_dp), c(-Inf, 0.3, 0.7, Inf), labels = c("débil", "moderada", "fuerte")))
+texto(
+  "**Conclusión.** La correlación de Pearson es ", round(r_dp, 3), " (", txt_p(cor_pearson$p.value),
+  "; IC 95 % [", round(cor_pearson$conf.int[1], 3), "; ", round(cor_pearson$conf.int[2], 3), "]) y la de Spearman es ",
+  round(unname(cor_spearman$estimate), 3), ". ",
+  if (cor_pearson$p.value < 0.05) {
+    paste0("**Se rechaza $H_0$**: existe una asociación lineal ", ifelse(r_dp > 0, "positiva", "negativa"),
+           " de intensidad **", intensidad, "**; ",
+           ifelse(r_dp > 0, "mayores distancias tienden a acompañarse de mayores precios. ", "mayores distancias tienden a acompañarse de menores precios. "))
+  } else {
+    "**No se rechaza $H_0$**: no hay evidencia de asociación lineal. "
+  },
+  "La distancia explica aproximadamente el ", round(r_dp^2 * 100, 1),
+  " % de la variabilidad del precio ($r^2$); el resto depende de otros factores como el tipo de servicio y la empresa."
+)
+```
+
+### Modelo de regresión lineal múltiple
+
+Las pruebas anteriores comparan factores de uno en uno. Para estimar el efecto de cada factor manteniendo constantes los demás se ajusta un modelo lineal sobre el logaritmo del precio:
+
+$$
+\ln(\text{precio}) = \beta_0 + \beta_1\,\text{distancia} + \beta_2\,\text{surge} + \text{servicio} + \text{bloque horario} + \text{lluvia} + \text{temperatura} + \text{viento} + \text{humedad} + \varepsilon.
+$$
+
+Con el logaritmo, cada coeficiente se interpreta como un cambio porcentual aproximado del precio, $(e^{\beta}-1)\times100$. Las variables climáticas continuas se estandarizan, por lo que su coeficiente corresponde a un aumento de una desviación estándar. El tipo de servicio se incluye como control (su efecto no se muestra) y absorbe la diferencia entre empresas.
+
+**Hipótesis.** Para cada factor $j$ del modelo se contrasta si su efecto es distinto de cero manteniendo constantes los demás:
+
+$$
+H_0:\beta_j=0
+\qquad
+H_1:\beta_j\neq0\quad\text{(bilateral)}.
+$$
+
+Además, la prueba $F$ global contrasta si el modelo en su conjunto aporta algo: $H_0:\beta_1=\cdots=\beta_p=0$ frente a $H_1$: al menos un coeficiente es distinto de cero.
+
+**Cómo se interpreta.** Un factor con $p<0.05$ tiene un efecto estadísticamente distinto de cero. El signo del efecto indica si aumenta o disminuye el precio, y el IC su magnitud plausible. El $R^2$ indica la proporción de la variabilidad explicada por el modelo.
+
+```{r}
+datos_modelo <- datos_limpios %>%
+  mutate(across(c(temp, wind, humidity), ~as.numeric(scale(.x)), .names = "{.col}_z"))
+
+modelo_lm <- lm(
+  log(price) ~ distance + name + surge_multiplier + hora_bloque +
+    lluvia + temp_z + wind_z + humidity_z,
+  data = datos_modelo
+)
+
+etiquetas_term <- c(
+  "distance" = "Distancia (+1 milla)",
+  "surge_multiplier" = "Multiplicador surge (+1)",
+  "hora_bloqueMañana" = "Mañana (vs. madrugada)",
+  "hora_bloqueTarde" = "Tarde (vs. madrugada)",
+  "hora_bloqueNoche" = "Noche (vs. madrugada)",
+  "lluviaCon lluvia" = "Con lluvia (vs. sin lluvia)",
+  "temp_z" = "Temperatura (+1 DE)",
+  "wind_z" = "Viento (+1 DE)",
+  "humidity_z" = "Humedad (+1 DE)"
+)
+
+coefs <- tidy(modelo_lm, conf.int = TRUE) %>%
+  filter(term != "(Intercept)", !str_starts(term, "name")) %>%
+  mutate(
+    efecto = (exp(estimate) - 1) * 100,
+    ic_inf = (exp(conf.low) - 1) * 100,
+    ic_sup = (exp(conf.high) - 1) * 100,
+    termino = coalesce(unname(etiquetas_term[term]), term)
+  )
+
+coefs %>%
+  transmute(termino, efecto, ic_inf, ic_sup, p_valor = fmt_p(p.value)) %>%
+  tabla(
+    paste0("Efecto porcentual sobre el precio (R² = ", round(glance(modelo_lm)$r.squared, 3), ")"),
+    col.names = c("Factor", "Efecto (%)", "IC inf. (%)", "IC sup. (%)", "Valor p")
+  )
+```
+
+```{r}
+coefs_plot <- coefs %>% arrange(efecto) %>% mutate(termino = factor(termino, levels = termino))
+
+plot_ly(
+  coefs_plot, x = ~efecto, y = ~termino, type = "scatter", mode = "markers",
+  marker = list(color = paleta[["marino"]], size = 10),
+  error_x = list(
+    type = "data", symmetric = FALSE, color = paleta[["marino"]],
+    array = coefs_plot$ic_sup - coefs_plot$efecto,
+    arrayminus = coefs_plot$efecto - coefs_plot$ic_inf
+  ),
+  hovertemplate = "%{y}<br>Efecto: %{x:.2f} %<extra></extra>"
+) %>%
+  tema_plotly(
+    titulo = "Efecto de cada factor sobre el precio",
+    subtitulo = "Cambio porcentual con IC del 95 %, controlando por el resto de factores y por el servicio",
+    xlab = "Cambio en el precio (%)", margen = list(l = 180),
+    shapes = list(list(
+      type = "line", x0 = 0, x1 = 0, y0 = 0, y1 = 1, yref = "paper",
+      line = list(color = paleta[["gris"]], dash = "dot")
+    ))
+  )
+```
+
+```{r results='asis', echo=FALSE}
+ef <- function(t) coefs$efecto[coefs$term == t]
+gl <- glance(modelo_lm)
+
+signif_terms <- coefs$termino[coefs$p.value < 0.05]
+no_signif <- coefs$termino[coefs$p.value >= 0.05]
+
+texto(
+  "**Conclusión.** La prueba $F$ global arroja ",
+  txt_p(gl$p.value),
+  ifelse(
+    gl$p.value < 0.05,
+    ", de modo que **se rechaza** que todos los coeficientes sean cero, y el modelo",
+    ", de modo que **no se rechaza** que todos los coeficientes sean cero, y el modelo"
+  ),
+  " explica el ",
+  round(gl$r.squared * 100, 1),
+  " % de la variabilidad del logaritmo del precio. A nivel de cada factor (α = 0.05), son significativos: ",
+  if (length(signif_terms)) {
+    paste(signif_terms, collapse = "; ")
+  } else {
+    "ninguno"
+  },
+  "; no son significativos: ",
+  if (length(no_signif)) {
+    paste(no_signif, collapse = "; ")
+  } else {
+    "ninguno"
+  },
+  ". Manteniendo constantes el servicio y el resto de factores, cada milla adicional se asocia con un cambio de ",
+  round(ef("distance"), 1),
+  " % en el precio y cada unidad adicional del multiplicador de tarifa con un cambio de ",
+  round(ef("surge_multiplier"), 1),
+  "%. La presencia de lluvia se asocia con un cambio de ",
+  round(ef("lluviaCon lluvia"), 2),
+  " %, un efecto ",
+  if (abs(ef("lluviaCon lluvia")) < 1) {
+    "muy pequeño en términos prácticos"
+  } else {
+    "relevante en términos prácticos"
+  },
+  ". Se trata de asociaciones observacionales y no de efectos causales."
+)
+```
+## Resumen de resultados y limitaciones
+
+```{r}
+concl <- function(p) ifelse(p < 0.05, "Se rechaza H₀ al 5 %", "No se rechaza H₀ al 5 %")
+n_cat <- nrow(comparacion_cat)
+
+tibble(
+  analisis = c(
+    "Precio medio: Uber vs. Lyft",
+    "Precio por categoría equivalente",
+    "Tarifa dinámica vs. normal (Lyft)",
+    "Precio con vs. sin lluvia, por empresa",
+    "Tarifa dinámica con vs. sin lluvia (Lyft)",
+    "ANOVA por tipo de servicio",
+    "Correlación distancia–precio"
+  ),
+  hipotesis = c(
+    "H₀: μ_Uber = μ_Lyft; H₁: μ_Uber ≠ μ_Lyft",
+    "H₀: μ_Uber = μ_Lyft en cada categoría; H₁: ≠",
+    "H₀: μ_normal = μ_dinámica; H₁: ≠",
+    "H₀: μ_con lluvia = μ_sin lluvia; H₁: ≠",
+    "H₀: p_con lluvia = p_sin lluvia; H₁: ≠",
+    "H₀: todas las medias iguales; H₁: al menos una distinta",
+    "H₀: ρ = 0; H₁: ρ ≠ 0"
+  ),
+  prueba = c(
+    prueba_uber_lyft$metodo,
+    paste0(paste(unique(comparacion_cat$metodo), collapse = " / "), " (Holm)"),
+    surge_test$metodo,
+    paste0(paste(unique(clima_empresa$metodo), collapse = " / "), " (Holm)"),
+    "Prueba de proporciones",
+    if (usar_welch) "ANOVA de Welch (Levene rechaza)" else "ANOVA clásico (Levene no rechaza)",
+    "Pearson"
+  ),
+  p_valor = c(
+    prueba_uber_lyft$p_valor, max(comparacion_cat$p_ajustado), surge_test$p_valor,
+    max(clima_empresa$p_ajustado), prueba_proporcion$p.value, p_anova, cor_pearson$p.value
+  ),
+  conclusion = c(
+    concl(prueba_uber_lyft$p_valor),
+    paste0("Diferencia significativa en ", sum(comparacion_cat$p_ajustado < 0.05), " de ", n_cat, " categorías"),
+    concl(surge_test$p_valor),
+    paste0("Diferencia significativa en ", sum(clima_empresa$p_ajustado < 0.05), " de ", nrow(clima_empresa), " empresas"),
+    concl(prueba_proporcion$p.value), concl(p_anova), concl(cor_pearson$p.value)
+  )
+) %>%
+  mutate(p_valor = fmt_p(p_valor)) %>%
+  tabla(
+    "Resumen de pruebas inferenciales",
+    col.names = c("Análisis", "Hipótesis (alternativa bilateral)", "Prueba", "Valor p (el mayor, si hay varias pruebas)", "Conclusión")
+  )
+```
+
+Un valor $p<0.05$ proporciona evidencia estadística contra la hipótesis nula correspondiente, mientras que un valor $p\geq0.05$ no permite rechazarla. La decisión estadística no debe interpretarse como una prueba de que la hipótesis nula sea verdadera, sino como una evaluación de la evidencia disponible bajo el modelo utilizado.
+
+Los resultados deben leerse con las siguientes limitaciones:
+
+- **Independencia.** Cada solicitud de viaje genera cotizaciones para varios servicios y los precios son estimaciones, no viajes completados. Las observaciones no son independientes, lo que hace que los valores $p$ y los intervalos sean más optimistas de lo que sugiere el tamaño de muestra. Por ello se prioriza la interpretación de los tamaños de efecto.
+- **Alcance.** Los datos corresponden a una sola ciudad y a un periodo de pocas semanas, por lo que no permiten generalizar a otras épocas del año ni a otras ciudades.
+- **Supuestos de las pruebas.** La elección entre *t* de Student, *t* de Welch y Wilcoxon se apoya en el tamaño de muestra (teorema central del límite) y en la prueba de Levene. Con muestras tan grandes, Levene detecta diferencias mínimas de varianza y la prueba de normalidad no es informativa; por eso se usan junto con las medidas de magnitud del efecto.
+- **Supuestos de preparación.** La lluvia ausente se interpretó como ausencia de precipitación, las horas sin medición meteorológica se completaron con la observación más cercana, y las equivalencias entre servicios de Uber y Lyft son un criterio del análisis.
+- **Naturaleza observacional.** Las asociaciones encontradas (por ejemplo, entre tarifa dinámica y lluvia) no establecen relaciones causales.
